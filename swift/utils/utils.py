@@ -389,10 +389,13 @@ def patch_getattr(obj_cls, item_name: str):
 
     def __new_getattr__(self, key: str):
         try:
-            return super(self.__class__, self).__getattr__(key)
+            # Use __getattribute__ to avoid re-entering this __getattr__ implementation
+            # which previously caused infinite recursion when the attribute was missing.
+            return super(self.__class__, self).__getattribute__(key)
         except AttributeError:
             if item_name in dir(self):
-                item = getattr(self, item_name)
+                # Fetch the delegated attribute without triggering __getattr__ again.
+                item = super(self.__class__, self).__getattribute__(item_name)
                 return getattr(item, key)
             raise
 

@@ -498,6 +498,25 @@ register_template(
 class Qwen3VLTemplate(Qwen2VLTemplate):
     version = 'v3'
 
+    def init_processor(self, processor) -> None:
+        # Ensure pulse pad tokens are treated as placeholders so safe_decode and
+        # template expansion behave like video/image pads (collapsed to
+        # `[token_id * N]`).
+        super().init_processor(processor)
+        if processor is None:
+            return
+
+        tokenizer = processor.tokenizer
+        for tok in (
+            getattr(processor, 'pulse_frame_token', None),
+            getattr(processor, 'pulse_object_token', None),
+        ):
+            if tok is None:
+                continue
+            tok_id = tokenizer.convert_tokens_to_ids(tok)
+            if tok_id not in self.placeholder_tokens:
+                self.placeholder_tokens.append(tok_id)
+
     def _encode(self, inputs: StdTemplateInputs) -> Dict[str, Any]:
         encoded = Template._encode(self, inputs)
         processor = self.processor
@@ -537,6 +556,63 @@ class Qwen3VLTemplate(Qwen2VLTemplate):
                 input_ids, labels, loss_scale = self._extend_tokens(input_ids, labels, loss_scale, idx_list,
                                                                     _get_new_tokens)
                 encoded.update(media_inputs)
+
+        # Pulse handling mirrors video flow: call processor to materialize pulse placeholders
+        # and expand the corresponding tokens, while attaching pulse pixel inputs.
+        pulse_data = getattr(inputs, 'pulses', None)
+        if pulse_data:
+            split_token = self._tokenize('\n')[0]
+            vision_start = getattr(processor, 'vision_start_token', '<|vision_start|>')
+            vision_end = getattr(processor, 'vision_end_token', '<|vision_end|>')
+            pulse_frame_token = getattr(processor, 'pulse_frame_token', '<|pulse_frame_pad|>')
+            pulse_object_token = getattr(processor, 'pulse_object_token', '<|pulse_object_pad|>')
+
+            # Token sequences (can be multi-token if tokenizer lacks dedicated specials)
+            pulse_frame_seq = processor.tokenizer.encode(
+                f"{vision_start}{pulse_frame_token}{vision_end}", add_special_tokens=False)
+            pulse_object_seq = processor.tokenizer.encode(
+                f"{vision_start}{pulse_object_token}{vision_end}", add_special_tokens=False)
+
+            frame_positions = findall(input_ids, pulse_frame_seq)
+            object_positions = findall(input_ids, pulse_object_seq)
+
+            has_object = bool(object_positions)
+            pulse_placeholder = f"{vision_start}{pulse_frame_token}{vision_end}"
+            if has_object:
+                pulse_placeholder += f"{vision_start}{pulse_object_token}{vision_end}"
+
+            pulse_inputs = processor(
+                text=['\n'.join([pulse_placeholder] * len(pulse_data))],
+                pulses=pulse_data,
+                return_tensors='pt',
+                do_resize=False,
+                **inputs.mm_processor_kwargs)
+
+            pulse_tokens_per_sample = self._split_list(pulse_inputs['input_ids'][0].tolist(), split_token)
+            pulse_inputs.pop('input_ids', None)
+            pulse_inputs.pop('attention_mask', None)
+
+            idx_list: List[int] = frame_positions + object_positions
+            kinds: List[str] = ['frame'] * len(frame_positions) + ['object'] * len(object_positions)
+
+            # Keep the order of appearance
+            zipped = sorted(zip(idx_list, kinds), key=lambda x: x[0])
+            idx_list = [z[0] for z in zipped]
+            kinds = [z[1] for z in zipped]
+
+            frame_idx = -1
+
+            def _get_pulse_tokens(i: int):
+                nonlocal frame_idx
+                # Replace the frame token with the full expanded tokens; drop the object token to avoid duplication
+                if kinds[i] == 'frame':
+                    frame_idx += 1
+                    return pulse_tokens_per_sample[frame_idx]
+                return []
+
+            input_ids, labels, loss_scale = self._extend_tokens(input_ids, labels, loss_scale, idx_list,
+                                                                _get_pulse_tokens)
+            encoded.update(pulse_inputs)
 
         encoded['input_ids'] = input_ids
         encoded['labels'] = labels

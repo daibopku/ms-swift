@@ -1827,6 +1827,26 @@ class Template(ProcessorMixin):
         if not self.use_megatron and self.sequence_parallel_size > 1:
             res = self._sp_data_collator(res, padding_to, self.tokenizer, padding_side)
 
+        res.update(self._data_collator_pulse(batch))
+        return res
+    
+    def _data_collator_pulse(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Custom data collator logic for pulse inputs."""
+        res = {}
+        pulse_frame_values = [b['pulse_frame_values'] for b in batch if b.get('pulse_frame_values') is not None]
+        if len(pulse_frame_values) > 0:
+            res['pulse_frame_values'] = torch.concat(pulse_frame_values)
+            
+        # pulse_timestamps = [b['pulse_timestamps'] for b in batch if b.get('pulse_timestamps') is not None]
+        # if len(pulse_timestamps) > 0:
+        #     res['pulse_timestamps'] = pulse_timestamps
+        
+         # grid thw
+
+        for pulse_type in ['pulse_frame']:
+            grid_thw = self.concat_tensor(batch, f'{pulse_type}_grid_thw', 0)
+            if grid_thw is not None:
+                res[f'{pulse_type}_grid_thw'] = grid_thw
         return res
 
     def _pad_3d_position_ids(self,

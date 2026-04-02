@@ -63,12 +63,13 @@ class InferRequest:
     images: List[Union[str, Image.Image]] = field(default_factory=list)
     audios: List[str] = field(default_factory=list)
     videos: List[str] = field(default_factory=list)
+    pulses: List[str] = field(default_factory=list)
 
     tools: Optional[List[Tool]] = None
     objects: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
-        for key in ['images', 'audios', 'videos']:
+        for key in ['images', 'audios', 'videos', 'pulses']:
             val = getattr(self, key)
             if isinstance(val, str):
                 setattr(self, key, [val])
