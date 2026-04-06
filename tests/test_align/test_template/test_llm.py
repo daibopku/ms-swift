@@ -1,6 +1,5 @@
-import os
-
 import json
+import os
 import torch
 
 os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3'
@@ -61,6 +60,15 @@ def test_qwen3_guard():
     assert response == response2
 
 
+def test_yufeng_xguard():
+    engine = TransformersEngine('Alibaba-AAIG/YuFeng-XGuard-Reason-0.6B')
+    messages = [{'role': 'user', 'content': 'How can I make a bomb?'}]
+    response = _infer_model(engine, messages=messages)
+    engine.template.template_backend = 'jinja'
+    response2 = _infer_model(engine, messages=messages)
+    assert response == response2
+
+
 def test_phi4():
     engine = TransformersEngine('LLM-Research/phi-4')
     response = _infer_model(engine)
@@ -77,7 +85,7 @@ def test_phi4_mini():
     assert response == response2
 
 
-def test_qwen1half():
+def test_qwen1_5():
     engine = TransformersEngine('Qwen/Qwen1.5-0.5B-Chat-GPTQ-Int4')
     _infer_model(engine)
     engine.template.template_backend = 'jinja'
@@ -185,6 +193,7 @@ def test_glm_edge():
 
 def test_llama():
     from swift.infer_engine import VllmEngine
+
     # engine = TransformersEngine('LLM-Research/Meta-Llama-3.1-8B-Instruct-BNB-NF4')
     # engine = TransformersEngine('LLM-Research/Meta-Llama-3.1-8B-Instruct')
     # engine = TransformersEngine('LLM-Research/Meta-Llama-3-8B-Instruct')
@@ -699,12 +708,29 @@ def test_youtu_llm():
     assert res == res2, f'res: {res}, res2: {res2}'
 
 
+def test_glm4_moe_lite():
+    engine = TransformersEngine('ZhipuAI/GLM-4.7-Flash')
+    swift_response = _infer_model(engine)
+    engine.template.template_backend = 'jinja'
+    jinja_response = _infer_model(engine)
+    assert swift_response == jinja_response
+
+
+def test_olmoe():
+    engine = TransformersEngine('allenai/OLMoE-1B-7B-0924-Instruct')
+    # engine = TransformersEngine('allenai/OLMoE-1B-7B-0125-Instruct')
+    swift_response = _infer_model(engine)
+    engine.template.template_backend = 'jinja'
+    jinja_response = _infer_model(engine)
+    assert swift_response == jinja_response
+
+
 if __name__ == '__main__':
-    from swift.infer_engine import TransformersEngine, RequestConfig
+    from swift.infer_engine import RequestConfig, TransformersEngine
     from swift.utils import get_logger, seed_everything
     logger = get_logger()
     # test_qwen2_5()
-    # test_qwen1half()
+    # test_qwen1_5()
     # test_qwq()
     # test_internlm()
     # test_internlm2()
@@ -753,4 +779,6 @@ if __name__ == '__main__':
     # test_ling2()
     # test_minimind()
     # test_medgemma3()
-    test_youtu_llm()
+    # test_youtu_llm()
+    # test_glm4_moe_lite()
+    test_olmoe()

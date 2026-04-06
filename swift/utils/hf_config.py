@@ -1,9 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 
-from typing import Any, Dict, List, Optional, Tuple, Union
-
 import torch
 from transformers import PretrainedConfig
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from .utils import deep_getattr
 
@@ -102,12 +101,6 @@ class HfConfigFactory:
             else:
                 setattr(config, attr_name, value)
         return len(attrs)
-
-    @staticmethod
-    def set_model_config_attr(model, attr_name: str, value: Any) -> None:
-        for module in model.modules():
-            if getattr(module, 'config', None) and getattr(module.config, attr_name, value) != value:
-                setattr(module.config, attr_name, value)
 
     @staticmethod
     def get_max_model_len(config: Union[PretrainedConfig, Dict[str, Any]]) -> Optional[int]:

@@ -11,10 +11,9 @@ correctly handle the distributed computation by:
 3. All-reducing partial sums for final results
 """
 
-from typing import Optional, Tuple
-
 import torch
 from megatron.core import mpu
+from typing import Optional, Tuple
 
 
 def vocab_parallel_log_softmax(logits: torch.Tensor) -> torch.Tensor:
@@ -208,8 +207,12 @@ def compute_logps_and_entropy_from_logits(
     Note: In Megatron, labels are already shifted (via torch.roll in get_batch_on_this_tp_rank),
     so logits and labels are already aligned. No additional shift is needed here.
 
+    Temperature scaling should be applied by the caller before invoking this function,
+    so that this function remains a pure computation without side effects on the input.
+
     Args:
-        logits: Logits tensor [batch, seq, partition_vocab_size] or [1, total_tokens, partition_vocab_size]
+        logits: Logits tensor [batch, seq, partition_vocab_size] or [1, total_tokens, partition_vocab_size].
+                Should be pre-scaled by temperature if needed.
         labels: Token labels [batch, seq] or [1, total_tokens], -100 for masked positions
         compute_entropy: Whether to compute entropy (default: False)
         entropy_chunk_size: Chunk size for entropy computation (default: 512)

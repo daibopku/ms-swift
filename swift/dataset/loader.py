@@ -1,13 +1,12 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import numpy as np
 import os
 from contextlib import nullcontext
-from functools import partial
-from typing import Dict, List, Literal, Optional, Tuple, Union
-
-import numpy as np
 from datasets import Dataset as HfDataset
 from datasets import load_dataset as hf_load_dataset
+from functools import partial
 from modelscope.hub.utils.utils import get_cache_dir
+from typing import Dict, List, Literal, Optional, Tuple, Union
 
 from swift.hub import get_hub
 from swift.utils import get_logger, get_seed, safe_ddp_context, use_hf_hub
@@ -298,16 +297,6 @@ def load_dataset(
         num_proc = None
     train_datasets = []
     val_datasets = []
-    loader = DatasetLoader(
-        num_proc=num_proc,
-        load_from_cache_file=load_from_cache_file,
-        streaming=streaming,
-        hub_token=hub_token,
-        strict=strict,
-        download_mode=download_mode,
-        columns=columns,  # columns_mapping
-        remove_unused_columns=remove_unused_columns,
-    )
 
     use_hf_default = use_hf
     if use_hf_default is None:
@@ -325,6 +314,16 @@ def load_dataset(
                 dataset_syntax.dataset = dataset_meta.hf_dataset_id if use_hf else dataset_meta.ms_dataset_id
         else:
             dataset_meta = dataset_syntax.get_dataset_meta(use_hf)
+        loader = dataset_meta.loader(
+            num_proc=num_proc,
+            load_from_cache_file=load_from_cache_file,
+            streaming=streaming,
+            hub_token=hub_token,
+            strict=strict,
+            download_mode=download_mode,
+            columns=columns,  # columns_mapping
+            remove_unused_columns=remove_unused_columns,
+        )
         train_dataset = loader.load(dataset_syntax, dataset_meta, use_hf=use_hf)
         train_dataset, val_dataset = loader.post_process(
             train_dataset,

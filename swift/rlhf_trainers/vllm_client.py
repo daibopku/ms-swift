@@ -1,23 +1,22 @@
 import atexit
 import logging
+import requests
 import threading
 import time
+import torch
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
-from typing import List, Optional, Union
-from urllib.parse import urlparse
-
-import requests
-import torch
 from packaging import version
 from pydantic import ValidationError
 from requests import ConnectionError
 from torch import nn
+from typing import List, Optional, Union
+from urllib.parse import urlparse
 
 from swift.infer_engine import AdapterRequest, RequestConfig
 from swift.infer_engine.protocol import ChatCompletionResponse, RolloutInferRequest, RolloutOutput
 from swift.metrics import Metric
-from swift.utils import is_trl_available, is_vllm_ascend_available, is_vllm_available
+from swift.utils import get_torch_device, is_trl_available, is_vllm_ascend_available, is_vllm_available, synchronize
 from .utils import format_host_for_url, is_valid_ipv6_address, peft_config_to_dict, resolve_hostname
 
 if is_vllm_available():
@@ -190,14 +189,6 @@ class VLLMClient:
 
             world_size = vllm_world_size + 1
             rank = vllm_world_size
-            kwargs = {}
-            if trl_verison >= version.parse('0.20.0'):
-                try:
-                    client_device_uuid = str(torch.cuda.get_device_properties(device).uuid)
-                except Exception:
-                    client_device_uuid = '42'
-                kwargs['client_device_uuid'] = client_device_uuid
-
             # Use '::' for IPv6 hosts, '0.0.0.0' for IPv4 hosts
             bind_host = '::' if is_valid_ipv6_address(self.hosts[i]) else '0.0.0.0'
             response = self.sessions[i].post(
@@ -206,7 +197,6 @@ class VLLMClient:
                     'host': bind_host,
                     'port': self.group_ports[i],
                     'world_size': world_size,
-                    **kwargs
                 })
             if response.status_code != 200:
                 raise Exception(f'Server {i} init failed: {response.text}')
@@ -239,7 +229,13 @@ class VLLMClient:
                 if response.status_code != 200:
                     raise Exception(f'Server {i} update failed: {response.text}')
 
-                self.pynccl_comms[i].broadcast(weights, src=self.pynccl_comms[i].rank)
+                synchronize()
+                self.pynccl_comms[i].broadcast(
+                    weights,
+                    src=self.pynccl_comms[i].rank,
+                    stream=getattr(get_torch_device(), 'current_stream', lambda: None)())
+
+                synchronize()
                 self.pynccl_comms[i].group.barrier()
             except Exception as e:
                 errors[i] = e
@@ -284,7 +280,12 @@ class VLLMClient:
                 if response.status_code != 200:
                     raise Exception(f'Server {i} update adapter failed: {response.text}')
 
-                self.pynccl_comms[i].broadcast(flattened_tensor, src=self.pynccl_comms[i].rank)
+                synchronize()
+                self.pynccl_comms[i].broadcast(
+                    flattened_tensor,
+                    src=self.pynccl_comms[i].rank,
+                    stream=getattr(get_torch_device(), 'current_stream', lambda: None)())
+                synchronize()
                 self.pynccl_comms[i].group.barrier()
             except Exception as e:
                 errors[i] = e
@@ -342,8 +343,13 @@ class VLLMClient:
                     raise Exception(f'Server {i} update adapter failed: {response.text}')
 
                 # Broadcast each tensor individually
+                synchronize()
                 for name, param in lora_params.items():
-                    self.pynccl_comms[i].broadcast(param, src=self.pynccl_comms[i].rank)
+                    self.pynccl_comms[i].broadcast(
+                        param,
+                        src=self.pynccl_comms[i].rank,
+                        stream=getattr(get_torch_device(), 'current_stream', lambda: None)())
+                synchronize()
                 self.pynccl_comms[i].group.barrier()
             except Exception as e:
                 errors[i] = e
@@ -381,7 +387,12 @@ class VLLMClient:
                 if response.status_code != 200:
                     raise Exception(f'Server {i} update flattened params failed: {response.text}')
 
-                self.pynccl_comms[i].broadcast(flattened_tensor, src=self.pynccl_comms[i].rank)
+                synchronize()
+                self.pynccl_comms[i].broadcast(
+                    flattened_tensor,
+                    src=self.pynccl_comms[i].rank,
+                    stream=getattr(get_torch_device(), 'current_stream', lambda: None)())
+                synchronize()
                 self.pynccl_comms[i].group.barrier()
             except Exception as e:
                 errors[i] = e

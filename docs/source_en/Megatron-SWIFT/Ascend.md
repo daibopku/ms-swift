@@ -4,7 +4,7 @@ For environment preparation of Megatron-SWIFT on Ascend NPU, please refer to [NP
 
 ## NPU Performance Data Collection
 
-NPU performance collection is conducted through the `torch_npu.profiler.profile` interface. To begin, create an instance of `torch_npu.profiler.profile`, then use the `start` and `stop` methods to control the performance data collection process. During this process, modifications to the dependent Megatron source code are required, specifically altering the `train` function in the `Megatron-LM/megatron/training/training.py` file. Below is an example of the collection process:
+NPU performance collection is conducted through the `torch_npu.profiler.profile` interface. To begin, create an instance of `torch_npu.profiler.profile`, then use the `start` and `stop` methods to control the performance data collection process. During this process, modifications to the ms-swift source code are required, specifically altering the `train` function in the `swift/megatron/trainers/base.py` file. Below is an example of the collection process:
 
 ```python
 import torch_npu
@@ -26,19 +26,10 @@ prof = torch_npu.profiler.profile(
     with_stack=False,    # Close the collection of stack information
     experimental_config=experimental_config)
 prof.start()
-# megatron code
-while iteration < args.train_iters:
+# ms-swift code
+while state.iteration < args.train_iters:
   ...
-  (
-       loss_dict,
-        skipped_iter,
-        should_checkpoint,
-        should_exit,
-        exit_code,
-        grad_norm,
-        num_zeros_in_grad,
-  ) = train_step(
-            forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func)
+  metric, grad_norm, update_successful = train_step(train_data_iterator)
   # collect performance data
   prof.step()
   ...
@@ -62,7 +53,6 @@ def _patch_word_embeddings(self, kwargs):
     origin_forward = VocabParallelEmbedding.forward
 
     def forward(_self, input_):
-        from ..trainers.utils import split_cp_inputs
         args = get_args()
         reduce_scatter_embeddings = _self.reduce_scatter_embeddings
         _self.reduce_scatter_embeddings = False
@@ -105,7 +95,6 @@ def _patch_word_embeddings(self, kwargs, emb):          # Modification 1
     origin_forward = emb.word_embeddings.forward        # Modification 2
 
     def forward(input_):                                # Modification 3
-        from ..trainers.utils import split_cp_inputs
         args = get_args()
         _self = emb.word_embeddings                     # Modification 4
         reduce_scatter_embeddings = _self.reduce_scatter_embeddings
@@ -186,21 +175,21 @@ def train_step(self, forward_step_func, data_iterator, model, optimizer, opt_par
 
 ### Enable
 
-Additionally, since msprobe does not support fusion computation, you need to add `--no_bias_dropout_fusion True`, `--no_bias_swiglu_fusion True`, `--cross_entropy_loss_fusion False` to the launch script.
+Additionally, since msprobe does not support fusion computation, you need to add `--bias_dropout_fusion false`, `--bias_swiglu_fusion false`, `--cross_entropy_loss_fusion false` to the launch script.
 
 #### Example
 ```shell
-PYTORCH_CUDA_ALLOC_CONF='expandable_segments:True' \
+PYTORCH_NPU_ALLOC_CONF='expandable_segments:True' \
 NPROC_PER_NODE=2 \
 CUDA_VISIBLE_DEVICES=0,1 \
 megatron sft \
-    --load Qwen2.5-7B-Instruct-mcore \
+    --mcore_model Qwen2.5-7B-Instruct-mcore \
     --dataset 'AI-ModelScope/alpaca-gpt4-data-zh#500' \
               'AI-ModelScope/alpaca-gpt4-data-en#500' \
               'swift/self-cognition#500' \
     --tensor_model_parallel_size 2 \
     ...
-    --no_bias_dropout_fusion True \
-    --no_bias_swiglu_fusion True \
-    --cross_entropy_loss_fusion False
+    --bias_dropout_fusion false \
+    --bias_swiglu_fusion false \
+    --cross_entropy_loss_fusion false
 ```

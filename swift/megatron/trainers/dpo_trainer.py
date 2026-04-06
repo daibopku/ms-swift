@@ -1,10 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import torch
 from collections import namedtuple
 from functools import partial
-
-import torch
 from megatron.core import mpu
-from megatron.training import get_args, get_timers
 from torch.distributed.nn import all_reduce
 
 from swift.rlhf_trainers import DPOTrainer
@@ -15,12 +13,11 @@ logger = get_logger()
 
 
 class DummyDPOTrainer(DPOTrainer):
-    # For reusing the dpo_loss function in TRL.
+    # For reusing the dpo_loss function implemented in Swift's DPOTrainer.
     def __init__(self, args):
-        from trl.trainer import FDivergenceConstants
         self.accelerator = namedtuple('Accelerator', ['device'])(device=get_current_device())
         self.f_alpha_divergence_coef = 1.
-        self.f_divergence_params = {FDivergenceConstants.ALPHA_DIVERGENCE_COEF_KEY: self.f_alpha_divergence_coef}
+        self.f_divergence_params = {'alpha_divergence_coef': self.f_alpha_divergence_coef}
         self.reference_free = args.reference_free
         self.label_smoothing = args.label_smoothing
         self.f_divergence_type = args.f_divergence_type
@@ -33,12 +30,11 @@ class MegatronDPOTrainer(MegatronRLHFTrainer):
     def __init__(self, args, template):
         super().__init__(args, template)
         self.dummy_dpo_trainer = DummyDPOTrainer(args)
-        self.ref_models = []
 
     def loss_func(self, output_tensor: torch.Tensor, *, labels: torch.Tensor, packed_seq_params):
         ref_output_tensor = output_tensor[:output_tensor.shape[0] // 2].detach()
         output_tensor = output_tensor[output_tensor.shape[0] // 2:]
-        args = get_args()
+        args = self.args
         num_samples = labels.shape[0] // 2 if packed_seq_params is None else packed_seq_params.num_samples
 
         logps = self.get_logps(output_tensor, labels, packed_seq_params, num_samples * 2)
@@ -75,20 +71,15 @@ class MegatronDPOTrainer(MegatronRLHFTrainer):
             metric['nll_loss'] = nll_loss.detach()
         metric = self._all_reduce_metric(metric)
         # fix megatron-lm bug
-        # https://github.com/NVIDIA/Megatron-LM/blob/core_r0.12.0/megatron/core/pipeline_parallel/schedules.py#L291
         loss = loss / mpu.get_context_parallel_world_size()
         return loss, metric
 
     def forward_step(self, data_iterator, model):
-        timers = get_timers()
         # Get the batch.
         unwrapped_model = model.module.module
         input_tensor = unwrapped_model.get_input_tensor()
         vp_stage = unwrapped_model.vp_stage
-        timers('batch-generator', log_level=2).start()
-        with self.stimer(bdata=True):
-            data = self.get_batch(data_iterator, vp_stage)
-        timers('batch-generator').stop()
+        data = self.get_batch(data_iterator, vp_stage)
         data.pop('loss_scale', None)
         # ref_model
         with torch.no_grad(), self.null_ref_context() as ref_models:
@@ -99,7 +90,6 @@ class MegatronDPOTrainer(MegatronRLHFTrainer):
 
         if input_tensor is not None:
             unwrapped_model.set_input_tensor(input_tensor[input_tensor.shape[0] // 2:])
-        with self.stimer:
-            output_tensor = model(**data)
+        output_tensor = model(**data)
         return torch.concat([ref_output_tensor, output_tensor], dim=0), partial(
             self.loss_func, labels=data.get('labels'), packed_seq_params=data.get('packed_seq_params'))

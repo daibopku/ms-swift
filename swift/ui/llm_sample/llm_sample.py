@@ -1,16 +1,15 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import gradio as gr
+import json
 import os
 import re
 import sys
 import time
 from datetime import datetime
 from functools import partial
-from typing import Type
-
-import gradio as gr
-import json
 from json import JSONDecodeError
 from transformers.utils import is_torch_cuda_available, is_torch_npu_available
+from typing import Type
 
 from swift.arguments import SamplingArguments
 from swift.dataset import get_dataset_list
@@ -196,8 +195,10 @@ class LLMSample(BaseUI):
         kwargs.update(more_params)
         model = kwargs.get('model')
         if os.path.exists(model) and os.path.exists(os.path.join(model, 'args.json')):
-            kwargs['ckpt_dir'] = kwargs.pop('model')
-            with open(os.path.join(kwargs['ckpt_dir'], 'args.json'), 'r', encoding='utf-8') as f:
+            args_path = os.path.join(model, 'args.json')
+            if os.path.exists(os.path.join(model, 'adapter_config.json')):
+                kwargs['adapters'] = kwargs.pop('model')
+            with open(args_path, 'r', encoding='utf-8') as f:
                 _json = json.load(f)
                 kwargs['model_type'] = _json['model_type']
                 kwargs['tuner_type'] = _json['tuner_type']

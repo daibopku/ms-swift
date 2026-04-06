@@ -1,10 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import os
-from contextlib import nullcontext
-from typing import List, Optional, Union
-
 import peft
+from contextlib import nullcontext
 from packaging import version
+from typing import List, Optional, Union
 
 from swift.arguments import BaseArguments, RLHFArguments
 from swift.dataset import DatasetLoader, load_dataset
@@ -60,6 +59,10 @@ class SwiftRLHF(SwiftSft):
         if model_id_or_path is None:
             return
 
+        if args.rlhf_type == 'ppo' and key == 'reward' and isinstance(model_id_or_path, (list, tuple)):
+            assert len(model_id_or_path) == 1, f'model_id_or_path: {model_id_or_path}'
+            model_id_or_path = model_id_or_path[0]
+
         if model_type is None:
             model_info, _ = get_model_info_meta(model_id_or_path)
             model_type = model_info.model_type
@@ -84,7 +87,7 @@ class SwiftRLHF(SwiftSft):
             model, processor = args.get_model_processor(
                 model=model_id_or_path,
                 model_type=model_type,
-                model_revision=model_revision,
+                revision=model_revision,
                 task_type=task_type,
                 num_labels=num_labels)
 
@@ -102,7 +105,7 @@ class SwiftRLHF(SwiftSft):
             self.train_msg['value_model_parameter_info'] = model_parameter_info
             logger.info(f'value_model_parameter_info: {model_parameter_info}')
 
-        HfConfigFactory.set_model_config_attr(model, 'use_cache', False)
+        HfConfigFactory.set_config_attr(model.config, 'use_cache', False)
         return model, processor
 
     def _prepare_model_tokenizer(self):
@@ -135,14 +138,15 @@ class SwiftRLHF(SwiftSft):
             rms = args.reward_model if isinstance(args.reward_model, list) else [args.reward_model]
             num_rms = len(rms)
             rm_types = args.reward_model_type if args.reward_model_type else [None] * num_rms
+            rm_templates = args.reward_template if args.reward_template else [None] * num_rms
             rm_revisions = args.reward_model_revision if args.reward_model_revision else [None] * num_rms
-            assert len(rms) == len(rm_types) == len(rm_revisions)
+            assert len(rms) == len(rm_types) == len(rm_templates) == len(rm_revisions)
 
             self.reward_model = []
             if args.rlhf_type == 'grpo':
                 self.reward_template = []
 
-            for reward_model_path, rm_type, rm_revision in zip(rms, rm_types, rm_revisions):
+            for reward_model_path, rm_type, rm_template, rm_revision in zip(rms, rm_types, rm_templates, rm_revisions):
                 args.reward_model = reward_model_path  # Temporarily set for prepare_single_model
                 result = self._prepare_single_model('reward', None, rm_type, rm_revision)
                 if result is not None:
@@ -150,14 +154,15 @@ class SwiftRLHF(SwiftSft):
                     self.reward_model.append(model)
 
                     if args.rlhf_type == 'grpo':
-                        reward_template = self.args.get_template(processor, template_type=processor.model_meta.template)
+                        template_type = rm_template or processor.model_meta.template
+                        reward_template = self.args.get_template(processor, template_type=template_type)
                         if reward_template.use_model:
                             reward_template.model = model
                         self.reward_template.append(reward_template)
-                args.reward_model = rms  # Restore original value
-                if args.rlhf_type != 'grpo' and self.reward_model:
-                    assert len(self.reward_model) <= 1
-                    self.reward_model = self.reward_model[0]
+            args.reward_model = rms  # Restore original value
+            if args.rlhf_type != 'grpo' and self.reward_model:
+                assert len(self.reward_model) <= 1
+                self.reward_model = self.reward_model[0]
 
         super()._prepare_model_tokenizer()
 
@@ -227,8 +232,13 @@ class SwiftRLHF(SwiftSft):
             trainer_kwargs['reward_funcs'] = self.args.reward_funcs
             if self.args.chord_sft_dataset:
                 trainer_kwargs['chord_sft_dataset'], _ = self._prepare_chord_sft_dataset()
-        if self.args.rlhf_type == 'gkd' and self.args.teacher_deepspeed:
-            trainer_kwargs['teacher_deepspeed_config'] = self.args.teacher_deepspeed
+        if self.args.rlhf_type == 'gkd':
+            if self.args.teacher_deepspeed:
+                trainer_kwargs['teacher_deepspeed_config'] = self.args.teacher_deepspeed
+            trainer_kwargs['gkd_logits_topk'] = self.args.gkd_logits_topk
+            if self.args.teacher_model_server:
+                trainer_kwargs['teacher_model_server'] = self.args.teacher_model_server
+            trainer_kwargs['teacher_use_disable_adapter'] = getattr(self.args, '_teacher_use_disable_adapter', False)
         return trainer_kwargs
 
 

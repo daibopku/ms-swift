@@ -8,7 +8,6 @@ pip install "transformers>=4.57" "qwen_vl_utils>=0.0.14"
 pip install "ms-swift>=4.0"
 # pip install "vllm>=0.11.0"  # If using the vLLM inference backend for inference
 ```
-- About slow training: When using PyTorch 2.9, you may encounter slow training issues with the conv3d operator. Please try using PyTorch 2.8 as a workaround. For more information, refer to [this issue](https://github.com/pytorch/pytorch/issues/166122). In ms-swift>=3.11.2, you can work around this issue by setting `SWIFT_PATCH_CONV3D=1`. For more details, see [this issue](https://github.com/modelscope/ms-swift/issues/7108).
 - About video data training hangs: Using the decord backend for video reading may cause the training process to hang, see [this issue](https://github.com/dmlc/decord/issues/269). You can use the torchcodec backend instead. For details, refer to the [qwen_vl_utils](https://github.com/QwenLM/Qwen3-VL/blob/50068df2334f309979ff05d75f1078c8309c63ed/qwen-vl-utils/src/qwen_vl_utils/vision_process.py#L390-L400) library.
 
 
@@ -153,7 +152,7 @@ Here's a breakdown of what unfolds:
 Overall, this is a sweet, lighthearted video that showcases the innocence and imagination of early childhood. The child's engagement with the book, combined with their glasses and playful demeanor, creates a delightful and memorable scene.
 ```
 
-- For model-specific parameters, such as environment variables like `VIDEO_MAX_TOKEN_NUM`, please refer to the [Command Line Parameters Documentation](../Instruction/Command-line-parameters.md#qwen3_vl).
+- For model-specific parameters, such as environment variables like `VIDEO_MAX_TOKEN_NUM`, please refer to the [Command Line Parameters Documentation](../Instruction/Command-line-parameters.md#qwen3_vl-qwen3_5).
 
 
 ## Training
@@ -266,7 +265,6 @@ VIDEO_MAX_TOKEN_NUM=128 \
 FPS_MAX_FRAMES=16 \
 megatron sft \
     --model Qwen/Qwen3-VL-30B-A3B-Instruct \
-    --load_safetensors true \
     --save_safetensors true \
     --dataset 'AI-ModelScope/alpaca-gpt4-data-zh#10000' \
               'AI-ModelScope/LaTeX_OCR:human_handwrite#5000' \
@@ -284,18 +282,18 @@ megatron sft \
     --recompute_granularity full \
     --recompute_method uniform \
     --recompute_num_layers 1 \
-    --max_epochs 1 \
+    --num_train_epochs 1 \
     --finetune true \
     --cross_entropy_loss_fusion true \
     --lr 1e-5 \
     --lr_warmup_fraction 0.05 \
     --min_lr 1e-6 \
-    --save megatron_output/Qwen3-VL-30B-A3B-Instruct \
-    --eval_interval 500 \
-    --save_interval 500 \
+    --output_dir megatron_output/Qwen3-VL-30B-A3B-Instruct \
+    --eval_steps 500 \
+    --save_steps 500 \
     --max_length 4096 \
     --packing true \
-    --num_workers 8 \
+    --dataloader_num_workers 8 \
     --dataset_num_proc 8 \
     --no_save_optim true \
     --no_save_rng true \

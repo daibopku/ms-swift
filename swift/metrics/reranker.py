@@ -1,13 +1,31 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from typing import Dict
-
 import numpy as np
 from transformers import EvalPrediction
+from typing import Dict
 
+from swift.utils import get_logger
 from .base import EvalMetrics
+from .utils import Metric
+
+logger = get_logger()
 
 
-class RerankerMetrics(EvalMetrics):
+class RerankerMetrics(EvalMetrics, Metric):
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        Metric.__init__(self)
+        self.add_state('logits', default_factory=list)
+        self.add_state('labels', default_factory=list)
+
+    def update(self, logits, labels):
+        self.logits.append(logits.cpu().numpy())
+        self.labels.append(labels.cpu().numpy())
+
+    def compute(self):
+        predictions = np.concatenate(self.logits)
+        labels = np.concatenate(self.labels)
+        return self._calculate_metrics(predictions, labels)
 
     def compute_metrics(self, eval_prediction: EvalPrediction) -> Dict[str, float]:
         return self._calculate_metrics(eval_prediction.predictions, eval_prediction.label_ids)
@@ -71,12 +89,12 @@ class RerankerMetrics(EvalMetrics):
         for query_idx, (query_logits, query_labels) in enumerate(query_groups):
             # Skip groups that are too small (need at least 1 positive + 1 negative)
             if len(query_logits) < 2:
-                print(f'Query {query_idx}: Skipped (too small: {len(query_logits)} items)')
+                logger.info(f'Query {query_idx}: Skipped (too small: {len(query_logits)} items)')
                 continue
 
             # Verify that the first sample is positive (data format validation)
             if query_labels[0] != 1:
-                print(f'Query {query_idx}: Skipped (first sample not positive)')
+                logger.info(f'Query {query_idx}: Skipped (first sample not positive)')
                 continue
 
             # Step 3a: Calculate ranking within this query
@@ -116,7 +134,7 @@ class RerankerMetrics(EvalMetrics):
 
         # Step 4: Calculate mean metrics across all valid queries
         if len(mrr_scores) == 0:
-            print('No valid queries found for metric calculation')
+            logger.warning('No valid queries found for metric calculation')
             return {'mrr': 0.0, 'ndcg': 0.0}
 
         mean_mrr = np.mean(mrr_scores)

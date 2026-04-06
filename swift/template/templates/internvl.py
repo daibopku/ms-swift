@@ -1,9 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from functools import partial
-from typing import Any, Dict, List, Literal
-
 import torch
+from functools import partial
 from torch import nn
+from typing import Any, Dict, List, Literal
 
 from swift.utils import get_env_args, is_deepspeed_enabled
 from ..base import Template
@@ -210,10 +209,11 @@ class InternvlhfTemplate(Internvl2Template):
                 return ['<img>', [-100], '</img>\n']
 
     def _encode(self, inputs: StdTemplateInputs) -> Dict[str, Any]:
-        from transformers.image_utils import make_flat_list_of_images, concatenate_list
-        from transformers.video_utils import make_batched_videos
-        from swift.template.vision_utils import load_video_hf
         import numpy as np
+        from transformers.image_utils import concatenate_list, make_flat_list_of_images
+        from transformers.video_utils import make_batched_videos
+
+        from swift.template.vision_utils import load_video_hf
         encoded = super(InternvlTemplate, self)._encode(inputs)
         input_ids = encoded['input_ids']
         labels = encoded['labels']
@@ -328,6 +328,8 @@ class InternvlhfTemplate(Internvl2Template):
                 vision_feature_layer=self.config.vision_feature_layer,
                 vision_feature_select_strategy=self.config.vision_feature_select_strategy,
             )
+            if hasattr(image_features, 'pooler_output'):
+                image_features = image_features.pooler_output
             special_image_mask = input_ids == self.config.image_token_id
             special_image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
             image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
@@ -339,6 +341,8 @@ class InternvlhfTemplate(Internvl2Template):
                 vision_feature_layer=self.config.vision_feature_layer,
                 vision_feature_select_strategy=self.config.vision_feature_select_strategy,
             )
+            if hasattr(image_features, 'pooler_output'):
+                image_features = image_features.pooler_output
             inputs_embeds = inputs_embeds + image_features.mean() * 0.
         return {'inputs_embeds': inputs_embeds}
 

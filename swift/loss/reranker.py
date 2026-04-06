@@ -1,6 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import os
-
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -10,7 +9,7 @@ from swift.utils import get_last_valid_indices
 from .base import BaseLoss
 
 
-class RerankerLoss(BaseLoss):
+class PointwiseRerankerLoss(BaseLoss):
 
     def __call__(self, outputs, labels, **kwargs) -> torch.Tensor:
         logits = outputs.logits

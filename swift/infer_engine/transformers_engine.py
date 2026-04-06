@@ -2,21 +2,20 @@
 import asyncio
 import hashlib
 import inspect
+import json
 import pickle
 import time
-from copy import deepcopy
-from queue import Queue
-from threading import Thread
-from typing import Any, AsyncIterator, Dict, Iterator, List, Optional, Union
-
-import json
 import torch
 import torch.nn.functional as F
+from copy import deepcopy
 from PIL import Image
+from queue import Queue
+from threading import Thread
 from torch import nn
 from tqdm import tqdm
 from transformers import GenerationConfig, LogitsProcessorList
 from transformers.utils import is_torch_npu_available
+from typing import Any, AsyncIterator, Dict, Iterator, List, Optional, Union
 
 from swift.metrics import Metric
 from swift.model import get_model_processor
@@ -56,10 +55,12 @@ class TransformersEngine(InferEngine):
             torch_dtype: Optional[torch.dtype] = None,
             model_type: Optional[str] = None,
             attn_impl: Optional[str] = None,
+            experts_impl: Optional[str] = None,
             device_map: Optional[Union[str, Dict[str, Any]]] = None,
             task_type: Optional[str] = None,
             quantization_config=None,
             model_kwargs: Optional[Dict[str, Any]] = None,
+            template_type: Optional[str] = None,
             # hub kwargs
             use_hf: Optional[bool] = None,
             revision: Optional[str] = None,
@@ -74,6 +75,7 @@ class TransformersEngine(InferEngine):
         self.torch_dtype = torch_dtype
         self.model_type = model_type
         self.attn_impl = attn_impl
+        self.experts_impl = experts_impl
         self.device_map = device_map
         self.task_type = task_type
         self.quantization_config = quantization_config
@@ -84,7 +86,7 @@ class TransformersEngine(InferEngine):
         self.hub_token = hub_token
         if isinstance(model, str):
             self.model, processor = self._get_model_processor(model, **kwargs)
-            template = self._get_template(processor)
+            template = self._get_template(processor, template_type=template_type)
         elif isinstance(model, nn.Module):
             self.model = model
             if template is None:
@@ -92,7 +94,6 @@ class TransformersEngine(InferEngine):
         super().__init__(template)
         for adapter in self.adapters:
             self._add_adapter(safe_snapshot_download(adapter, use_hf=self.use_hf, hub_token=self.hub_token))
-        self.template.patch_model(self.model)
         self.engine = self.model  # dummy
         self.generation_config = getattr(self.model, 'generation_config', None)
         self._queue = Queue()
@@ -111,6 +112,7 @@ class TransformersEngine(InferEngine):
             device_map=self.device_map,
             quantization_config=self.quantization_config,
             attn_impl=self.attn_impl,
+            experts_impl=self.experts_impl,
             task_type=self.task_type,
             model_kwargs=self.model_kwargs,
             **kwargs)

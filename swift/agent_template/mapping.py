@@ -4,9 +4,10 @@ from .extra import ReactGRPOAgentTemplate
 from .glm4 import ChatGLM4AgentTemplate, GLM4_5AgentTemplate, GLM4_7AgentTemplate, GLM4AgentTemplate
 from .hermes import HermesAgentTemplate, HunyuanHermesAgentTemplate
 from .llama import Llama3AgentTemplate, Llama4AgentTemplate
+from .minimax_m2 import MinimaxM2AgentTemplate
 from .mistral import MistralAgentTemplate
 from .qwen import QwenEnAgentTemplate, QwenEnParallelAgentTemplate, QwenZhAgentTemplate, QwenZhParallelAgentTemplate
-from .qwen3_coder import Qwen3CoderAgentTemplate
+from .qwen3_coder import Qwen3_5AgentTemplate, Qwen3CoderAgentTemplate
 from .react import ReactEnAgentTemplate, ReactZnAgentTemplate
 from .seed_oss import SeedAgentTemplate
 from .toolbench import ToolBenchAgentTemplate
@@ -22,6 +23,7 @@ agent_template_map = {
     'qwen_en_parallel': QwenEnParallelAgentTemplate,
     'qwen_zh_parallel': QwenZhParallelAgentTemplate,
     'qwen3_coder': Qwen3CoderAgentTemplate,
+    'qwen3_5': Qwen3_5AgentTemplate,
     'hermes': HermesAgentTemplate,
     'hunyuan_hermes': HunyuanHermesAgentTemplate,
     'toolbench': ToolBenchAgentTemplate,  # ref: https://modelscope.cn/datasets/swift/ToolBench
@@ -33,6 +35,7 @@ agent_template_map = {
     'llama4': Llama4AgentTemplate,
     # ref: https://huggingface.co/deepseek-ai/DeepSeek-V3.1
     'deepseek_v3_1': DeepSeekV31AgentTemplate,
+    'minimax_m2': MinimaxM2AgentTemplate,
     'seed_oss': SeedAgentTemplate,
     # extra
     'react_grpo': ReactGRPOAgentTemplate,

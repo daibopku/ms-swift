@@ -2,16 +2,15 @@
 # Part of the implementation is borrowed from huggingface/transformers.
 import inspect
 import os
-from contextlib import contextmanager, nullcontext
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
-
 import torch
+from contextlib import contextmanager, nullcontext
 from peft import PeftModel
 from torch import nn
 from torch.nn.utils.rnn import pad_sequence
 from transformers import Seq2SeqTrainer as HfSeq2SeqTrainer
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 from transformers.utils import is_peft_available
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from swift.infer_engine import InferRequest, RequestConfig, TransformersEngine
 from swift.sequence_parallel import sequence_parallel
@@ -109,8 +108,9 @@ class Seq2SeqTrainer(SwiftMixin, DataLoaderMixin, HfSeq2SeqTrainer):
                 inputs['logits_to_keep'] = int(inputs['logits_to_keep'].sum())
 
         base_model = self.template.get_base_model(self.model)
-        if self.model.model_info.is_moe_model and 'output_router_logits' in inspect.signature(
-                base_model.forward).parameters:
+        forward_params = inspect.signature(base_model.forward).parameters
+        if self.model.model_info.is_moe_model and any(key in forward_params
+                                                      for key in ['output_router_logits', 'kwargs']):
             HfConfigFactory.set_config_attr(base_model.config, 'router_aux_loss_coef', args.router_aux_loss_coef)
             base_model.router_aux_loss_coef = args.router_aux_loss_coef
             logger.info_once(f'router_aux_loss_coef: {args.router_aux_loss_coef}')
@@ -170,7 +170,7 @@ class Seq2SeqTrainer(SwiftMixin, DataLoaderMixin, HfSeq2SeqTrainer):
                     loss_scale = torch.roll(loss_scale, shifts=-1, dims=-1).view(-1)
                     outputs.loss = outputs.loss * loss_scale
 
-                if self.args.enable_channel_loss and channels is not None:
+                if self.args.enable_channel_loss:
                     mode = 'train' if self.model.training else 'eval'
                     metrics = self.custom_metrics[mode]
                     masks = torch.roll(labels, shifts=-1, dims=-1).view(-1) != -100
@@ -179,7 +179,7 @@ class Seq2SeqTrainer(SwiftMixin, DataLoaderMixin, HfSeq2SeqTrainer):
                     else:
                         cu_seqlens = torch.arange(0, labels.shape[0] + 1) * labels.shape[1]
                     for i in range(cu_seqlens.shape[0] - 1):
-                        channel = channels[i]
+                        channel = None if channels is None else channels[i]
                         slice_ = slice(cu_seqlens[i], cu_seqlens[i + 1])
                         metrics[f'loss_{channel}'].update(outputs.loss[slice_][masks[slice_]])
 

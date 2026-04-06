@@ -1,29 +1,31 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import math
 import os
-from contextlib import contextmanager, nullcontext
-from functools import partial
-from types import MethodType
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
-
 import torch
 import transformers
+from contextlib import contextmanager, nullcontext
+from functools import partial
 from packaging import version
 from peft import PeftModel
 from transformers import (AutoConfig, AutoModel, AutoModelForCausalLM, AutoModelForSequenceClassification,
                           AutoTokenizer, GenerationConfig, PretrainedConfig, PreTrainedModel, PreTrainedTokenizerBase)
 from transformers.integrations import is_deepspeed_zero3_enabled
 from transformers.utils import strtobool
+from types import MethodType
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
-from swift.utils import HfConfigFactory, Processor, get_logger, is_unsloth_available, patch_getattr
+from swift.utils import (HfConfigFactory, Processor, get_generative_reranker_logits, get_logger, is_unsloth_available,
+                         patch_getattr)
 from .constant import ModelType
 from .model_meta import MODEL_MAPPING, BaseModelLoader, ModelInfo, ModelMeta, get_model_info_meta
 from .patcher import (get_lm_head_model, patch_attach_align_device_hook_on_blocks, patch_automodel,
-                      patch_automodel_for_sequence_classification, patch_get_dynamic_module, patch_mp_ddp,
-                      patch_tp_plan)
+                      patch_automodel_for_sequence_classification, patch_get_dynamic_module, patch_module_forward,
+                      patch_mp_ddp, patch_tp_plan)
 from .utils import AttnImpl, InitModelStrategy, get_default_device_map
 
 logger = get_logger()
+
+transformers_5 = version.parse(transformers.__version__) >= version.parse('5.0.0.dev')
 
 
 def register_model(model_meta: ModelMeta, *, exist_ok: bool = False) -> None:
@@ -52,7 +54,7 @@ def load_by_unsloth(args):
 
     @contextmanager
     def _patch_distributed_function():
-        from unsloth_zoo import utils, compiler
+        from unsloth_zoo import compiler, utils
 
         def distributed_function(n=1, function=None, *args, **kwargs):
             return function(*args, **kwargs)
@@ -99,8 +101,8 @@ def _patch_awq_compat(model_info):
 
     try:
         # compat transformers>=4.50 (autoawq)
-        from transformers.quantizers.quantizer_awq import AwqQuantizer
         from transformers.integrations import get_keys_to_not_convert
+        from transformers.quantizers.quantizer_awq import AwqQuantizer
         _process_model_before_weight_loading = AwqQuantizer._process_model_before_weight_loading
 
         def _new_process_model_before_weight_loading(self, model, *args, **kwargs):
@@ -119,11 +121,11 @@ def _set_property(model, key):
     if not hasattr(model, 'model'):
         return
     text_model = model.model
-    if not hasattr(text_model, key):
+    if not hasattr(text_model, key) or hasattr(model.__class__, key):
         return
 
     def _value(self):
-        return getattr(text_model, key)
+        return getattr(self.model, key)
 
     setattr(model.__class__, key, property(_value))
 
@@ -165,6 +167,7 @@ class ModelLoader(BaseModelLoader):
         load_model: bool = False,
         # model kwargs
         attn_impl: Optional[str] = None,
+        experts_impl: Optional[str] = None,
         rope_scaling: Optional[Dict[str, Any]] = None,
         max_model_len: Optional[int] = None,
         auto_model_cls=None,
@@ -179,6 +182,13 @@ class ModelLoader(BaseModelLoader):
         attn_impl = attn_impl or kwargs.get('attn_implementation')
         self.attn_impl = attn_impl
         self.attn_impl_keys = None
+        experts_impl = experts_impl or kwargs.get('experts_implementation')
+        if experts_impl is not None and not transformers_5:
+            if experts_impl == 'eager':
+                experts_impl = None
+            else:
+                raise ValueError('experts_impl is only supported in "transformers>=5.0".')
+        self.experts_impl = experts_impl
         self.rope_scaling = rope_scaling
         self.max_model_len = max_model_len
         self.auto_model_cls = auto_model_cls
@@ -201,7 +211,6 @@ class ModelLoader(BaseModelLoader):
         else:
             model_kwargs['torch_dtype'] = self.torch_dtype
         _patch_awq_compat(model_info)
-        logger.info(f'model_kwargs: {model_kwargs}')
 
     def _postprocess_config(self, config):
         # fix prediction_step (internvl2, ovis, ...)
@@ -214,6 +223,11 @@ class ModelLoader(BaseModelLoader):
         HfConfigFactory.compat_zero3(config)
 
         if self.rope_scaling:
+            if transformers_5:
+                rope_parameters = HfConfigFactory.get_config_attr(config, 'rope_parameters') or {}
+                for key in ['rope_theta', 'partial_rotary_factor']:
+                    if self.rope_scaling.get(key) is None and rope_parameters.get(key) is not None:
+                        self.rope_scaling[key] = rope_parameters[key]
             HfConfigFactory.set_config_attr(config, 'rope_scaling', self.rope_scaling)
         if self.max_model_len:
             HfConfigFactory.set_max_model_len(config, self.max_model_len)
@@ -244,7 +258,8 @@ class ModelLoader(BaseModelLoader):
     def get_processor(self, model_dir: str, config: PretrainedConfig) -> Processor:
         auto_tokenizer_cls = self.auto_tokenizer_cls
         if auto_tokenizer_cls is None:
-            if os.path.exists(os.path.join(model_dir, 'preprocessor_config.json')):
+            if os.path.exists(os.path.join(model_dir, 'preprocessor_config.json')) or os.path.exists(
+                    os.path.join(model_dir, 'processor_config.json')):
                 from transformers import AutoProcessor
                 auto_tokenizer_cls = AutoProcessor
             else:
@@ -253,10 +268,15 @@ class ModelLoader(BaseModelLoader):
 
     def get_model(self, model_dir: str, config: PretrainedConfig, processor: Processor,
                   model_kwargs) -> PreTrainedModel:
+        if self.experts_impl is not None:
+            model_kwargs['experts_implementation'] = self.experts_impl
+        logger.info(f'model_kwargs: {model_kwargs}')
         model_info = self.model_info
         model_meta = self.model_meta
         auto_model_cls = self.auto_model_cls
         model = None
+        if model_info.task_type in {'seq_cls', 'reranker'}:
+            HfConfigFactory.set_config_attr(config, 'tie_word_embeddings', False)
         if model_info.task_type in {'seq_cls', 'reranker'} and auto_model_cls is None and not self.return_dummy_model:
             with patch_automodel_for_sequence_classification(model_config=config, patch_from_pretrained=False):
                 try:
@@ -300,7 +320,20 @@ class ModelLoader(BaseModelLoader):
         if model_info.task_type == 'embedding' and auto_model_cls.__name__ != 'AutoModel':
             from swift.model.patcher import patch_output_normalizer
             patch_output_normalizer(model, model_meta=model_meta)
+        elif model_info.task_type == 'generative_reranker':
+            self._patch_generative_reranker(model, processor)
+        if transformers_5:
+            self._compat_transformers5(model)
         return model
+
+    def _patch_generative_reranker(self, model, processor):
+        tokenizer = self._get_tokenizer(processor)
+        lm_head_model = get_lm_head_model(model, self.model_meta).lm_head
+
+        def lm_head_forward(module, hidden_states):
+            return get_generative_reranker_logits(module.weight, tokenizer, hidden_states)
+
+        patch_module_forward(lm_head_model, lm_head_forward)
 
     def _postprocess_model(self, model_dir, model):
         model_info = self.model_info
@@ -311,29 +344,27 @@ class ModelLoader(BaseModelLoader):
         if self.leaf_modules is not None or model_info.is_moe_model:
             # deepspeed zero3
             self._deepspeed_set_z3_leaf_modules(model, self.leaf_modules)
-        if version.parse(transformers.__version__) >= version.parse('5.0.0.dev'):
-            self._compat_transformers5(model)
         model.model_info = self.model_info
         model.model_meta = self.model_meta
         model.model_dir = model_dir
         self._init_generation_config(model, model_dir)
-        HfConfigFactory.set_model_config_attr(model, 'pad_token_id', self.pad_token)
+        HfConfigFactory.set_config_attr(model.config, 'pad_token_id', self.pad_token)
 
-    def _add_new_special_tokens(self, model, tokenizer):
+    def _add_new_special_tokens(self, model, processor, config):
         if not self.new_special_tokens:
             return
+        tokenizer = self._get_tokenizer(processor)
         num_new_tokens = tokenizer.add_special_tokens({'additional_special_tokens': self.new_special_tokens})
         if num_new_tokens > 0:
             logger.info(f'Added {num_new_tokens} new special tokens.')
-
-            if model is not None and not self.return_dummy_model:
-                llm_model = get_lm_head_model(model, self.model_meta)
-                origin_vocab_size = HfConfigFactory.get_config_attr(llm_model.config, 'vocab_size')
-                if origin_vocab_size < len(tokenizer):
-                    vocab_size = math.ceil(len(tokenizer) / 128) * 128
+            origin_vocab_size = HfConfigFactory.get_config_attr(config, 'vocab_size')
+            if origin_vocab_size < len(tokenizer):
+                vocab_size = math.ceil(len(tokenizer) / 128) * 128
+                # fix transformers==4.52.4 qwen2.5-vl
+                HfConfigFactory.set_config_attr(config, 'vocab_size', vocab_size)
+                if model is not None and not self.return_dummy_model:
+                    llm_model = get_lm_head_model(model, self.model_meta)
                     llm_model.resize_token_embeddings(vocab_size)
-                    # fix transformers==4.52.4 qwen2.5-vl
-                    HfConfigFactory.set_config_attr(llm_model.config, 'vocab_size', vocab_size)
 
     def _postprocess_processor(self, processor: Processor):
         tokenizer = self._get_tokenizer(processor)
@@ -382,6 +413,9 @@ class ModelLoader(BaseModelLoader):
             elif hf_model_type == 'glm4_moe':
                 from transformers.models.glm4_moe.modeling_glm4_moe import Glm4MoeMoE
                 z3_leaf_modules = [Glm4MoeMoE]
+            elif hf_model_type == 'glm4_moe_lite':
+                from transformers.models.glm4_moe_lite.modeling_glm4_moe_lite import Glm4MoeLiteMoE
+                z3_leaf_modules = [Glm4MoeLiteMoE]
             elif hf_model_type == 'glm4v_moe':
                 from transformers.models.glm4v_moe.modeling_glm4v_moe import Glm4vMoeTextMoE
                 z3_leaf_modules = [Glm4vMoeTextMoE]
@@ -394,6 +428,15 @@ class ModelLoader(BaseModelLoader):
             elif hf_model_type == 'qwen3_next':
                 from transformers.models.qwen3_next.modeling_qwen3_next import Qwen3NextSparseMoeBlock
                 z3_leaf_modules = [Qwen3NextSparseMoeBlock]
+            elif hf_model_type == 'olmoe':
+                from transformers.models.olmoe.modeling_olmoe import OlmoeSparseMoeBlock
+                z3_leaf_modules = [OlmoeSparseMoeBlock]
+            elif hf_model_type == 'qwen3_5_moe':
+                from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeSparseMoeBlock
+                z3_leaf_modules = [Qwen3_5MoeSparseMoeBlock]
+            elif hf_model_type == 'glm_moe_dsa':
+                from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import GlmMoeDsaMoE
+                z3_leaf_modules = [GlmMoeDsaMoE]
 
         if z3_leaf_modules:
             from deepspeed.utils import set_z3_leaf_modules
@@ -426,7 +469,7 @@ class ModelLoader(BaseModelLoader):
             self._postprocess_processor(processor)
             if model:
                 self._postprocess_model(model_dir, model)
-        self._add_new_special_tokens(model, processor)
+        self._add_new_special_tokens(model, processor, config)
         return model, processor
 
 
@@ -475,6 +518,7 @@ def get_model_processor(
     quantization_config=None,
     max_memory: Union[str, Dict[str, Any]] = None,
     attn_impl: Optional[str] = None,
+    experts_impl: Optional[str] = None,
     rope_scaling: Optional[Dict[str, Any]] = None,
     max_model_len: Optional[int] = None,
     auto_model_cls=None,
@@ -507,6 +551,8 @@ def get_model_processor(
         quantization_config: Configuration for model quantization.
         max_memory: Maximum memory allocation per device.
         attn_impl: Attention implementation. 'flash_attn' for Flash Attention, None for auto-select (sdpa/eager).
+        experts_impl: experts implementation. Options are 'grouped_mm', 'batched_mm', 'eager'. Defaults to None.
+            This feature requires "transformers>=5.0.0".
         rope_scaling: RoPE (Rotary Position Embedding) scaling configuration dictionary.
         max_model_len: Maximum sequence length the model can handle.
         auto_model_cls: Custom AutoModel class to use for loading (e.g., AutoModelForCausalLM).
@@ -562,6 +608,7 @@ def get_model_processor(
         model_meta,
         load_model=load_model,
         attn_impl=attn_impl,
+        experts_impl=experts_impl,
         rope_scaling=rope_scaling,
         max_model_len=max_model_len,
         auto_model_cls=auto_model_cls,
@@ -582,7 +629,7 @@ def get_processor(
     download_model: Optional[bool] = None,
     # model kwargs
     model_type: Optional[str] = None,
-    task_type: Literal['causal_lm', 'seq_cls', 'reranker', 'generative_reranker'] = None,
+    task_type: Literal['causal_lm', 'seq_cls', 'embedding', 'reranker', 'generative_reranker'] = None,
     num_labels: Optional[int] = None,
     problem_type: Literal['regression', 'single_label_classification', 'multi_label_classification'] = None,
     **kwargs,

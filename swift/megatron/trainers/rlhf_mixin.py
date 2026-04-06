@@ -1,44 +1,61 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from contextlib import contextmanager
-
 import torch
+from contextlib import contextmanager, nullcontext
 from megatron.core import mpu
-from megatron.training import get_args, get_model
-from megatron.training.checkpointing import load_checkpoint
-from megatron.training.utils import unwrap_model
 from torch.distributed.nn import all_reduce
 from transformers.utils import ContextManagers
 
-from swift.utils import get_logger
+from swift.megatron.model import get_mcore_model
+from swift.megatron.utils import (RouterReplayHelper, forward_step_helper, get_local_topk_idx_for_current_rank,
+                                  get_router_replay_data, load_mcore_checkpoint, set_router_replay_data)
+from swift.rlhf_trainers.utils import identity_data_collator
+from swift.utils import get_current_device, get_logger, safe_snapshot_download
 from .base import BaseMegatronTrainer
+from .vocab_parallel_utils import compute_logps_and_entropy_from_logits
 
 logger = get_logger()
 
 
 class MegatronRLHFTrainer(BaseMegatronTrainer):
 
-    def setup_model_and_optimizer(self, model_provider_func, model_type, *_args, **kwargs):
-        args = get_args()
+    def _load_checkpoint(self):
+        args = self.args
+        if args.mcore_ref_model is not None:
+            load_mcore_checkpoint(args, self.ref_models, load_arg='mcore_ref_model')
+        if args.mcore_ref_adapter is not None:
+            load_mcore_checkpoint(args, self.wrapped_models, load_arg='mcore_ref_adapter')
+        super()._load_checkpoint()
+
+    def prepare_model(self):
+        super().prepare_model()
+        args = self.args
+        self.ref_models = []
         if args.tuner_type == 'full' and args.rlhf_type not in ['rm', 'gkd']:
-            ref_models = get_model(model_provider_func, model_type, wrap_with_ddp=False)
-            args.ref_model = args.ref_model or args.model
-            if args.ref_load is None:
-                args.ref_load = args.load
-            for m in ref_models:
-                m = unwrap_model(m)
-                if args.ref_load is None:
-                    self.bridge.load_weights(m, args.ref_model)
-                m.requires_grad_(False).eval()
-            if args.ref_load:
-                load_checkpoint(ref_models, None, None, load_arg='ref_load')
-            self.ref_models = ref_models
-        return super().setup_model_and_optimizer(model_provider_func, model_type, *_args, **kwargs)
+            self.ref_models = get_mcore_model(args, self.template.config)
+        for ref_model in self.ref_models:
+            if not args.use_cpu_initialization:
+                ref_model.to(get_current_device())
+            ref_model.requires_grad_(False)
+            ref_model.eval()
+        if self.ref_models and args.mcore_ref_model is None:
+            ref_model_id_or_path = args.ref_model or args.model
+            ref_model_dir = safe_snapshot_download(ref_model_id_or_path, use_hf=args.use_hf, hub_token=args.hub_token)
+            self.bridge.load_weights(self.ref_models, ref_model_dir)
+        if args.tuner_type == 'lora' and args.ref_adapters and args.mcore_ref_adapter is None:
+            assert len(args.ref_adapters) == 1, 'Currently only support one adapter.'
+            self.bridge.load_weights(
+                self.ref_models, args.ref_adapters[0], peft_format=True, adapter_name='ref_adapter')
+
+    def _get_data_collator(self):
+        if self.args.rlhf_type in ('grpo', 'gkd'):
+            return identity_data_collator
+        return super()._get_data_collator()
 
     @contextmanager
     def null_ref_context(self):
-        args = get_args()
+        args = self.args
         contexts = []
-        has_ref_adapter = bool(args.ref_adapter_load or args.ref_adapters)
+        has_ref_adapter = bool(args.mcore_ref_adapter or args.ref_adapters)
         if args.tuner_type == 'full':
             ref_models = self.ref_models
         else:
@@ -56,7 +73,7 @@ class MegatronRLHFTrainer(BaseMegatronTrainer):
                     m.set_adapter('default')
 
     def get_logps(self, output_tensor, labels, packed_seq_params, num_samples, per_token=False):
-        args = get_args()
+        args = self.args
         per_token_logps = -output_tensor
         loss_mask = labels != -100
         per_token_logps = per_token_logps * loss_mask
@@ -79,6 +96,61 @@ class MegatronRLHFTrainer(BaseMegatronTrainer):
             all_logps = all_reduce(all_logps, group=mpu.get_context_parallel_group())
         return all_logps
 
+    def compute_per_token_logps(self, model, data_iterator, no_grad=True, temperature=1.0):
+        """Forward pass to get logits, then compute temperature-scaled per-token logps.
+
+        Unlike get_logps (which recovers logps from cross-entropy loss), this method
+        obtains raw logits from the model and computes logps with temperature scaling,
+        which is required for importance sampling in GRPO and potentially other algorithms.
+
+        Args:
+            model: The model to forward
+            data_iterator: Iterator providing batch data
+            no_grad: Whether to disable gradient computation (default: True)
+            temperature: Temperature for scaling logits before log_softmax
+
+        Returns:
+            per_token_logps tensor, or None if on a non-last PP stage
+            routing_topk_idx tensor, or None if disbale router replay
+        """
+        data = self.get_batch(data_iterator)
+        data.pop('loss_scale', None)
+        labels = data.get('labels')
+
+        routing_topk_idx = None
+        global_topk_idx = data.pop('routed_experts', None)
+        if self.enable_routing_replay and RouterReplayHelper.is_replay_forward_action(model.config):
+            assert global_topk_idx is not None, 'When router_replay_mode = R3, routed_experts must be in data'
+            routing_topk_idx = get_local_topk_idx_for_current_rank(global_topk_idx, model.config,
+                                                                   data.get('packed_seq_params'))
+            set_router_replay_data(routing_topk_idx, model.config)
+
+        data_for_forward = {k: v for k, v in data.items() if k != 'labels'}
+        context = torch.no_grad() if no_grad else nullcontext()
+        with context:
+            output_tensor = forward_step_helper(self.args, model, data_for_forward)
+
+        if self.enable_routing_replay and RouterReplayHelper.is_r2_record_action(model.config):
+            routing_topk_idx = get_router_replay_data(model.config)
+
+        if labels is None or output_tensor is None:
+            return None, routing_topk_idx
+
+        if temperature != 1.0:
+            output_tensor.div_(temperature)
+        per_token_logps, _ = compute_logps_and_entropy_from_logits(output_tensor, labels)
+
+        packed_seq_params = data.get('packed_seq_params')
+        if packed_seq_params is not None:
+            num_samples = packed_seq_params.num_samples
+        else:
+            input_ids = data.get('input_ids')
+            num_samples = input_ids.shape[0] if input_ids is not None else labels.shape[0]
+
+        if self.args.context_parallel_size > 1:
+            per_token_logps = self._postprocess_packed_tensor_cp(per_token_logps, packed_seq_params, num_samples)
+        return per_token_logps, routing_topk_idx
+
     def _postprocess_packed_tensor_cp(self, tensor, packed_seq_params, num_samples):
         """
         Generic method: In CP mode, all_gather and reconstruct full tensor sequences.
@@ -92,7 +164,7 @@ class MegatronRLHFTrainer(BaseMegatronTrainer):
         Returns:
             output_full: [1, packed_len] in padding_free mode, or [batch_size, seq_len] otherwise
         """
-        args = get_args()
+        args = self.args
         cp_size = args.context_parallel_size
         cp_rank = mpu.get_context_parallel_rank()
 

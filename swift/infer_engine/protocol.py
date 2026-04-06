@@ -1,19 +1,44 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import base64
 import io
+import json
+import numpy as np
 import os
 import time
 import uuid
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field, fields
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
-
-import json
 from PIL import Image
-from pydantic import BaseModel, Field, field_validator
+from pydantic import AfterValidator, BaseModel, Field, PlainSerializer, field_validator
+from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple, Union
 
 from swift.template import Messages, Tool
 from swift.utils import remove_response
+
+
+def serialize_ndarray(value):
+    if value is None:
+        return None
+    if isinstance(value, np.ndarray):
+        return {
+            'data': base64.b64encode(value.tobytes()).decode('ascii'),
+            'shape': value.shape,
+            'dtype': str(value.dtype),
+            '__ndarray__': True
+        }
+    return value
+
+
+def deserialize_ndarray(value):
+    if value is None:
+        return None
+    if isinstance(value, dict) and value.get('__ndarray__'):
+        data = base64.b64decode(value['data'])
+        return np.frombuffer(data, dtype=value['dtype']).reshape(value['shape'])
+    return value
+
+
+NumpyArray = Annotated[Any, PlainSerializer(serialize_ndarray, return_type=Dict), AfterValidator(deserialize_ndarray)]
 
 
 @dataclass
@@ -382,7 +407,7 @@ class ChatCompletionMessageToolCall:
 @dataclass
 class ChatMessage:
     role: Literal['system', 'user', 'assistant']
-    content: Union[str, List[Dict[str, Any]], int, float]
+    content: Union[str, List[Dict[str, Any]], int, float, List[float]]
     tool_calls: Optional[List[ChatCompletionMessageToolCall]] = None
     reasoning_content: Optional[str] = None
 
@@ -394,6 +419,7 @@ class ChatCompletionResponseChoice:
     finish_reason: Literal['stop', 'length', None]
     logprobs: Optional[Dict[str, List[Dict[str, Any]]]] = None
     token_ids: Optional[List[int]] = None
+    routed_experts: Optional[NumpyArray] = None
 
     def to_cmpl_choice(self) -> 'CompletionResponseChoice':
         self = deepcopy(self)
@@ -573,7 +599,6 @@ class InitCommunicatorRequest(BaseModel):
     host: str
     port: int
     world_size: int
-    client_device_uuid: Optional[str] = None
 
 
 class UpdateWeightsRequest(BaseModel):

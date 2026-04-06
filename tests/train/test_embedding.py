@@ -10,8 +10,8 @@ kwargs = {
 }
 
 
-def test_llm():
-    from swift import sft_main, SftArguments
+def test_embedding():
+    from swift import SftArguments, sft_main
     result = sft_main(
         SftArguments(
             model='Qwen/Qwen3-Embedding-0.6B',
@@ -29,7 +29,7 @@ def test_llm():
 
 
 def test_reranker():
-    from swift import sft_main, SftArguments
+    from swift import SftArguments, sft_main
     result = sft_main(
         SftArguments(
             model='Qwen/Qwen3-Reranker-4B',
@@ -56,7 +56,7 @@ def test_reranker():
 
 
 def test_reranker2():
-    from swift import sft_main, SftArguments
+    from swift import SftArguments, sft_main
     result = sft_main(
         SftArguments(
             model='Qwen/Qwen2.5-VL-3B-Instruct',
@@ -84,5 +84,5 @@ def test_reranker2():
 
 
 if __name__ == '__main__':
-    # test_llm()
+    # test_embedding()
     test_reranker()

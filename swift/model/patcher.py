@@ -1,24 +1,23 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import accelerate
 import copy
 import os
-from contextlib import contextmanager
-from functools import wraps
-from types import MethodType
-from typing import Any, Dict, List, Optional, Union
-
-import accelerate
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 import transformers
 from accelerate.utils import find_device
+from contextlib import contextmanager
+from functools import wraps
 from packaging import version
 from peft import PeftModel
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers import PreTrainedModel, dynamic_module_utils, trainer
 from transformers.modeling_outputs import SequenceClassifierOutputWithPast
+from types import MethodType
+from typing import Any, Dict, List, Optional, Union
 
 from swift.utils import (HfConfigFactory, deep_getattr, get_device_count, get_dist_setting, get_last_valid_indices,
                          get_logger, get_position_ids_from_cu_seqlens, is_mp, is_mp_ddp, safe_ddp_context, to_device,
@@ -89,10 +88,8 @@ def patch_output_normalizer(module: torch.nn.Module, model_meta):
 
     def _output_embedding_hook(module, args, kwargs, output):
         attention_mask = kwargs.get('attention_mask', None)
-        if attention_mask is None:
-            attention_mask = output.get('attention_mask', None)
         hidden_states = output.logits
-        sequence_lengths = get_last_valid_indices(attention_mask)
+        sequence_lengths = -1 if attention_mask is None else get_last_valid_indices(attention_mask)
         embeddings = hidden_states[torch.arange(hidden_states.shape[0], device=hidden_states.device), sequence_lengths]
         embeddings = F.normalize(embeddings, p=2, dim=1)
         return {
@@ -189,18 +186,15 @@ def transformers_seq_cls_forward(self, *args, origin_forward, padding_side=None,
     if padding_side == 'left':
         pooled_logits = logits[:, -1]
     else:
-        if self.config.pad_token_id is None and batch_size != 1:
+        pad_token_id = HfConfigFactory.get_config_attr(self.config, 'pad_token_id')
+        if pad_token_id is None and batch_size != 1:
             raise ValueError('Cannot handle batch sizes > 1 if no padding token is defined.')
-        if self.config.pad_token_id is None:
+        if pad_token_id is None:
             sequence_lengths = -1
         else:
-            if output.get('attention_mask') is not None:
-                # When use padding_free in seq_cls tasks, `revert_padding_free` will add a attention_mask in the output
-                batch_size = output.get('attention_mask').shape[0]
-                sequence_lengths = output.get('attention_mask').sum(dim=1) - 1
-            elif input_ids is not None:
+            if input_ids is not None:
                 # if no pad token found, use modulo instead of reverse indexing for ONNX compatibility
-                sequence_lengths = torch.eq(input_ids, self.config.pad_token_id).int().argmax(-1) - 1
+                sequence_lengths = torch.eq(input_ids, pad_token_id).int().argmax(-1) - 1
                 sequence_lengths = sequence_lengths % input_ids.shape[-1]
             elif kwargs.get('attention_mask') is not None:
                 sequence_lengths = get_last_valid_indices(kwargs['attention_mask'])
@@ -293,7 +287,6 @@ def patch_automodel_for_sequence_classification(model_info=None,
     from_pretrained = PreTrainedModel.from_pretrained.__func__
 
     # Patch 1: from_pretrained method
-    _new_from_pretrained = None
     if patch_from_pretrained:
 
         @classmethod
@@ -310,6 +303,8 @@ def patch_automodel_for_sequence_classification(model_info=None,
             res = from_pretrained(cls, *args, **kwargs)
             cls.__init__ = __init__
             return res
+    else:
+        _new_from_pretrained = None
 
     # Patch 2: missing __init__ methods
     # https://github.com/modelscope/ms-swift/pull/5820
@@ -404,6 +399,7 @@ def patch_automodel(model_info, model_meta, auto_model_cls, return_dummy_model, 
 def _get_max_memory(device_ids: List[int]) -> Dict[Union[int, str], int]:
     """add feat in accelerate to support MP + DDP"""
     import psutil
+
     # Make sure CUDA is initialized on each GPU to have the right memory info.
     for i in device_ids:
         _ = torch.tensor([0], device=i)
@@ -545,28 +541,20 @@ def revert_padding_free(outputs: Dict[str, Any], inputs: Dict[str, Any], padding
 
     max_length = max(seq_lengths)
     unpacked_logits = []
-    attention_mask = []
 
     start = 0
     for length in seq_lengths:
         seq_state = last_hidden_state[start:start + length]
-        mask = torch.ones((seq_state.shape[0])).to(last_hidden_state.device)
         padding = torch.zeros(
             (max_length - length, last_hidden_state.shape[-1])).to(last_hidden_state.dtype).to(last_hidden_state.device)
-        attention_padding = torch.zeros((max_length - length)).to(last_hidden_state.device)
         # re-padding
         if padding_side == 'left':
             seq_state = torch.cat((padding, seq_state), dim=0)
-            mask = torch.cat((attention_padding, mask), dim=0)
         else:
             seq_state = torch.cat((seq_state, padding), dim=0)
-            mask = torch.cat((mask, attention_padding), dim=0)
         unpacked_logits.append(seq_state)
-        attention_mask.append(mask)
         start += length
     outputs[hidden_state_key] = torch.stack(unpacked_logits, dim=0)
-    inputs['attention_mask'] = torch.stack(attention_mask, dim=0).to(torch.int64)
-    outputs['attention_mask'] = inputs['attention_mask']
     return outputs
 
 
@@ -578,7 +566,7 @@ def gather_sequence_parallel_outputs(
         Gather split tensors produced by sequence parallel training so that downstream
         components (loss, metrics, etc.) can operate on full-length sequences.
         """
-    from swift.sequence_parallel import sequence_parallel, GatherTensor
+    from swift.sequence_parallel import GatherTensor, sequence_parallel
 
     tensor_keys = tensor_keys or ['logits', 'last_hidden_state', 'hidden_states']
 
@@ -611,9 +599,9 @@ def patch_attach_align_device_hook_on_blocks():
 
 
 def patch_module_forward(module, new_forward):
-    if getattr(module, '_patch', False):
+    if getattr(module, '_patched', False):
         return
-    module._patch = True
+    module._patched = True
     new_forward_wrapped = MethodType(new_forward, module)
     if hasattr(module, '_old_forward'):  # device_map
         module._old_forward = new_forward_wrapped

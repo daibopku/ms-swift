@@ -1,9 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import os
 import sys
-from typing import Any, Dict
-
 from transformers import AutoTokenizer, PretrainedConfig, PreTrainedModel
+from typing import Any, Dict
 
 from swift.template import TemplateType
 from swift.utils import Processor, get_logger, git_clone_github
@@ -119,5 +118,6 @@ register_model(
             ], TemplateType.sus),
         ],
         architectures=['LlamaForCausalLM'],
+        mcore_model_type='gpt',
         model_arch=ModelArch.llama,
     ))

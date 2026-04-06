@@ -2,29 +2,28 @@
 import base64
 import concurrent.futures
 import inspect
+import json
 import os
 import re
 import time
+import torch
+import torch.nn as nn
 import uuid
+from accelerate.utils import broadcast_object_list, gather_object, is_peft_model, set_seed
 from collections import OrderedDict
 from concurrent.futures import Future
 from contextlib import contextmanager, nullcontext
 from copy import copy, deepcopy
+from dacite import from_dict
 from dataclasses import asdict, dataclass
 from math import ceil
-from queue import Queue
-from types import MethodType
-from typing import Any, Dict, List, Optional, Union
-
-import json
-import torch
-import torch.nn as nn
-from accelerate.utils import broadcast_object_list, gather_object, is_peft_model, set_seed
-from dacite import from_dict
 from peft.utils.save_and_load import get_peft_model_state_dict
+from queue import Queue
 from torch.nn import ModuleList
 from torch.utils.data import DataLoader
 from transformers import PreTrainedModel, TrainerCallback
+from types import MethodType
+from typing import Any, Dict, List, Optional, Union
 
 from swift.infer_engine import RequestConfig
 from swift.infer_engine.protocol import ChatCompletionResponse, RolloutInferRequest, RolloutOutput
@@ -39,8 +38,8 @@ from .rlhf_mixin import RLHFTrainerMixin
 from .utils import (FlattenedTensorBucket, TensorLoRARequest, _create_parameter_buckets,
                     _process_bucket_with_flattened_tensor, aggressive_empty_cache, check_vllm_version_ge,
                     get_even_process_data, get_gather_if_zero3_context, patch_lora_merge, patch_lora_unmerge,
-                    patch_profiling_context, patch_profiling_decorator, patch_vllm_load_adapter,
-                    patch_vllm_moe_model_weight_loader, set_expandable_segments)
+                    patch_vllm_load_adapter, patch_vllm_moe_model_weight_loader, profiling_context, profiling_decorator,
+                    set_expandable_segments)
 
 DataType = List[Dict[str, Union[torch.Tensor, Any]]]
 logger = get_logger()
@@ -168,8 +167,6 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
             self.use_gym_env = broadcast_object_list(use_gym_env, from_process=0)[0]
             self.enable_server_multi_turn = broadcast_object_list(enable_multi_turn, from_process=0)[0]
             self.rollout_enable_lora = broadcast_object_list(enable_lora, from_process=0)[0]
-            if self.use_gym_env:
-                self.reward_func_names = ['gym_reward']
 
         elif self.vllm_mode == 'colocate':
             if not self.accelerator.num_processes % self.vllm_tensor_parallel_size == 0:
@@ -227,6 +224,11 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
                                'If errors occur, please disable LoRA by setting vllm_enable_lora to False.')
 
             patch_vllm_load_adapter()
+
+        vllm_quantization = None
+        if model.model_info.quant_method == 'bnb' and model.model_info.quant_bits == 4:
+            vllm_quantization = 'bitsandbytes'
+
         logprobs_mode = 'processed_logprobs' if self.vllm_version_ge_0_10_2 else None
 
         with Swift.grpo_context(model, self.template.processor):
@@ -255,6 +257,7 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
                 distributed_executor_backend='external_launcher',
                 engine_kwargs=vllm_engine_kwargs,
                 logprobs_mode=logprobs_mode,
+                quantization=vllm_quantization,
                 **lora_kwargs,
             )
             set_expandable_segments(True)
@@ -369,7 +372,7 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
         parameters_no_lora = [remove_lora_and_prefix(p_list) for p_list in parameters]
         return parameters, parameters_no_lora
 
-    @patch_profiling_decorator
+    @profiling_decorator
     def _move_model_to_vllm(self, skip_async_check=False):
         """Synchronize model weights to vLLM engine"""
         args = self.args
@@ -606,6 +609,7 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
             State dict ready for vLLM
         """
         is_peft = is_peft_model(self.model)
+        should_merge_lora = self._is_fsdp2 and is_peft and not self.rollout_enable_lora
 
         raw_state_dict = {}
         if self._is_fsdp2:
@@ -628,11 +632,10 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
                 raw_state_dict[name] = param.data
 
         # Process: clean names, filter adapters (keep LoRA for FSDP2 to merge at tensor level)
-        state_dict = self._process_state_dict_for_vllm(
-            raw_state_dict, is_peft, keep_lora_weights=self._is_fsdp2 and is_peft)
+        state_dict = self._process_state_dict_for_vllm(raw_state_dict, is_peft, keep_lora_weights=should_merge_lora)
 
         # FSDP2 + LoRA: merge at tensor level (avoids issues with merge/unmerge on DTensor)
-        if self._is_fsdp2 and is_peft:
+        if should_merge_lora:
             state_dict = self._merge_lora_into_state_dict(state_dict)
 
         # Filter by parameter_group_no_lora
@@ -649,31 +652,34 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
     def _move_full_model_to_vllm(self):
         """Transfer full model weights to vLLM engine.
 
-        Manages the lifecycle of gather and merge/unmerge:
-        - gather_if_zero3: once for the entire sync (DeepSpeed Zero3)
+        Manages the lifecycle of gather and merge/unmerge per parameter_group:
+        - gather_if_zero3: per parameter_group batch (DeepSpeed Zero3)
         - merge/unmerge: per parameter_group (must be within gather context)
         - No clone needed: unmerge happens after load completes
         """
         is_peft = is_peft_model(self.model)
-        # For DeepSpeed, merge within gather context; FSDP2 uses tensor-level merge
-        should_merge = is_peft and not self._is_fsdp2
+        should_merge = is_peft and not self._is_fsdp2 and not self.rollout_enable_lora
 
         gather_if_zero3 = get_gather_if_zero3_context(self)
-        parameters = [] if self._is_fsdp2 else list(self.model.parameters())
 
-        with gather_if_zero3(parameters):
-            for i, parameter_group in enumerate(self.parameter_groups):
-                parameter_group_no_lora = self.parameter_groups_no_lora[i]
+        for i, parameter_group in enumerate(self.parameter_groups):
+            parameter_group_no_lora = self.parameter_groups_no_lora[i]
 
-                # Merge must be within gather context (needs full parameters)
+            if not self._is_fsdp2:
+                parameters = [
+                    parameter for name, parameter in self.model.named_parameters()
+                    if not parameter_group or name in parameter_group
+                ]
+            else:
+                parameters = []
+
+            with gather_if_zero3(parameters):
                 if should_merge:
                     with patch_lora_merge(self.model, parameter_group):
                         self.model.merge_adapter()
 
                 try:
-                    # Collect without clone - unmerge happens after load
                     state_dict = self._collect_state_dict_for_vllm(parameter_group, parameter_group_no_lora)
-                    # Data is copied here (FlattenedTensorBucket.copy_ or vLLM load_weights)
                     self._load_state_dict_to_vllm(state_dict)
                 finally:
                     if should_merge:
@@ -682,6 +688,8 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
 
         if is_peft:
             self.base_sync_done = True
+            if self.rollout_enable_lora:
+                self._move_adapter_to_vllm()
 
     def _rollout(self,
                  inputs: Optional[DataType],
@@ -1066,7 +1074,7 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
         use_tqdm: Optional[bool] = False,
     ) -> List[RolloutOutput]:
         """Perform inference using configured engine"""
-        with patch_profiling_context(self, 'generate'), self._disable_sp_context():
+        with profiling_context(self, 'generate'), self._disable_sp_context():
             if self.vllm_mode == 'server':
                 res = self.vllm_client.infer([asdict(req) for req in infer_requests],
                                              asdict(request_config),
@@ -1206,23 +1214,70 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
     def offload_optimizer(self):
         if not self.optimizer.state:
             return
+
+        if is_deepspeed_enabled():
+            # DeepSpeed optimizer: param_groups may be empty
+            for _, state in self.optimizer.state.items():
+                # Iterate over a copy to avoid dict size change errors
+                for key, value in list(state.items()):
+                    if not isinstance(value, torch.Tensor):
+                        continue
+                    # Skip if already on CPU
+                    if value.device.type == 'cpu':
+                        continue
+
+                    offload_key = f'{key}_offload_buffer'
+                    if offload_key not in state:
+                        state[offload_key] = torch.empty_like(value, device='cpu')
+
+                    state[offload_key].copy_(value, non_blocking=True)
+                    value.data = state[offload_key]
+            return
+
+        # Original non-DeepSpeed logic
         for param_group in self.optimizer.param_groups:
+            if not param_group.get('params'):
+                logger.warning("Empty param_group['params'] detected in non-DeepSpeed optimizer.")
+                continue
+
             for param in param_group['params']:
-                state = self.optimizer.state[param]
-                for key, value in state.items():
-                    if isinstance(value, torch.Tensor):
+                state = self.optimizer.state.get(param)
+                if not state:
+                    continue
+                for key, value in list(state.items()):  # Iterate over a list copy
+                    if isinstance(value, torch.Tensor) and value.device.type != 'cpu':
                         state[key] = value.to('cpu', non_blocking=True)
 
     @torch.no_grad()
     def load_optimizer(self):
-        device = get_current_device()
         if not self.optimizer.state:
             return
+
+        device = get_current_device()
+
+        if is_deepspeed_enabled():
+            for _, state in self.optimizer.state.items():
+                for key, value in list(state.items()):
+                    if not isinstance(value, torch.Tensor):
+                        continue
+
+                    offload_key = f'{key}_offload_buffer'
+                    if offload_key in state:
+                        value.data = state[offload_key].to(device, non_blocking=True)
+            return
+
+        # Original non-DeepSpeed logic
         for param_group in self.optimizer.param_groups:
+            if not param_group.get('params'):
+                logger.warning("Empty param_group['params'] detected in non-DeepSpeed optimizer.")
+                continue
+
             for param in param_group['params']:
-                state = self.optimizer.state[param]
-                for key, value in state.items():
-                    if isinstance(value, torch.Tensor):
+                state = self.optimizer.state.get(param)
+                if not state:
+                    continue
+                for key, value in list(state.items()):  # Iterate over a list copy
+                    if isinstance(value, torch.Tensor) and value.device.type == 'cpu':
                         state[key] = value.to(device, non_blocking=True)
 
     @contextmanager
@@ -1508,7 +1563,7 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
         with seed_context():
             self.truncated_resample_iterator = cyclic_iter(self.get_train_dataloader())
 
-    @patch_profiling_decorator
+    @profiling_decorator
     def resample_encode_failed_inputs(self, inputs: DataType, max_resample_rounds: int = 10) -> DataType:
         """
         Attempt to encode each input using the template. If encoding fails,

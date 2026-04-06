@@ -2,11 +2,10 @@
 import ast
 import math
 import os
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Literal, Optional, Union
-
 import torch
+from dataclasses import dataclass, field
 from transformers.utils import is_torch_mps_available
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from swift.model import MODEL_MAPPING, get_model_info_meta, get_model_name
 from swift.utils import HfConfigFactory, get_dist_setting, get_logger, json_parse_to_dict
@@ -36,6 +35,8 @@ class ModelArguments:
             'flash_attention_2', 'flash_attention_3', etc. Defaults to None, which means it will be read from
             'config.json'. Note: Support for these implementations depends on the model's transformers implementation.
             If set to 'flash_attn' (for backward compatibility), 'flash_attention_2' will be used.
+        experts_impl (Optional[str]): Expert implementation type, options are 'grouped_mm', 'batched_mm', 'eager'.
+            Defaults to None. This feature requires "transformers>=5.0.0".
         new_special_tokens (List[str]): Additional special tokens to be added to the tokenizer. Can also be a path to
             a `.txt` file, where each line is a special token. Defaults to an empty list `[]`.
         num_labels (Optional[int]): The number of labels for classification tasks (when `--task_type` is 'seq_cls').
@@ -74,6 +75,7 @@ class ModelArguments:
     # None: It will be automatically selected between sdpa and eager.
     # 'flash_attn', 'sdpa', 'eager', 'flex_attention', 'flash_attention_2', 'flash_attention_3'
     attn_impl: Optional[str] = None
+    experts_impl: Optional[str] = None
     new_special_tokens: List[str] = field(default_factory=list)
 
     num_labels: Optional[int] = None
@@ -234,6 +236,7 @@ class ModelArguments:
             'max_memory': self.max_memory,
             'quantization_config': self.get_quantization_config(),
             'attn_impl': self.attn_impl,
+            'experts_impl': self.experts_impl,
             'new_special_tokens': self.new_special_tokens,
             'rope_scaling': self.rope_scaling,
             'max_model_len': self.max_model_len,

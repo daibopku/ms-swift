@@ -2,6 +2,9 @@
 
 
 ## Dataset Format
+
+ms-swift leverages agent-template to decouple Agent data formats from model implementations. With a unified dataset format, users can seamlessly switch between different models for training without any data modifications.
+
 Example data samples for the pure text Agent and multimodal Agent are as follows:
 
 ```jsonl
@@ -151,8 +154,10 @@ The following code can be used to experiment with more models and `agent_templat
 ```python
 from swift import get_processor, get_template
 
-tokenizer = get_processor('ZhipuAI/GLM-4-9B-0414')
-template = get_template(tokenizer, agent_template='hermes')
+tokenizer = get_processor('Qwen/Qwen3.5-2B')
+template = get_template(tokenizer)  # Using default agent template
+# template = get_template(tokenizer, agent_template='qwen3_5')
+print(f'agent_template: {template._agent_template}')
 data = {...}
 template.set_mode('train')
 encoded = template.encode(data)
@@ -215,7 +220,26 @@ In such cases, use `--loss_scale ignore_empty_think` (see configuration file [ig
 The specific effect of this setting is:
 - Any string matching the regular expression `<think>\\s*</think>\\s*` is assigned a `loss_scale` of 0, meaning no loss is computed for these segments.
 
-For more `loss_scale` plugin designs, please refer to the [Pluginization](../Customization/Pluginization.md) documentation.
+
+Testing loss_scale using code:
+```python
+from swift import get_processor, get_template
+
+data = {"messages": [
+    {"role": "user", "content": "aaaaa"},
+    {"role": "assistant", "content": "<think>\n\n</think>\n\nabc<think>\n\n</think>\n\n123"},
+]}
+
+template = get_template(get_processor('Qwen/Qwen3-8B'), loss_scale='ignore_empty_think')
+template.set_mode('train')
+inputs = template.encode(data)
+
+print(template.safe_decode(inputs['labels']))
+# '[-100 * 14]abc<think>\n\n</think>\n\n123<|im_end|>\n'
+```
+
+
+For more `loss_scale` plugin designs, please refer to the [Architecture](../Customization/Architecture.md) documentation.
 
 ## Training
 

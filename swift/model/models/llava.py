@@ -1,7 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import sys
 from functools import wraps
-
 from transformers import PretrainedConfig, PreTrainedModel
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
@@ -17,7 +16,7 @@ class LlavaLlamaHfLoader(ModelLoader):
 
     def get_config(self, model_dir: str):
         from transformers import LlavaConfig
-        self.autoconfig_class = LlavaConfig
+        self.auto_config_cls = LlavaConfig
         return super().get_config(model_dir)
 
     def get_model(self, model_dir: str, *args, **kwargs) -> PreTrainedModel:

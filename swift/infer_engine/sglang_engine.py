@@ -2,20 +2,19 @@
 import asyncio
 import inspect
 import os
-from copy import deepcopy
-from typing import Any, AsyncIterator, Dict, Iterator, List, Optional, Union
-
 import sglang as sgl
 import torch
+from copy import deepcopy
 from PIL import Image
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from transformers import GenerationConfig
+from typing import Any, AsyncIterator, Dict, Iterator, List, Optional, Union
 
 from swift.metrics import Metric
 from swift.model import get_processor
 from swift.template import Template
-from swift.utils import get_logger
+from swift.utils import get_logger, safe_snapshot_download
 from .infer_engine import InferEngine
 from .protocol import (ChatCompletionResponse, ChatCompletionResponseChoice, ChatCompletionResponseStreamChoice,
                        ChatCompletionStreamResponse, ChatMessage, DeltaMessage, EmbeddingResponse,
@@ -34,6 +33,7 @@ class SglangEngine(InferEngine):
         template: Optional[Template] = None,
         torch_dtype: Optional[torch.dtype] = None,
         model_type: Optional[str] = None,
+        template_type: Optional[str] = None,
         use_hf: Optional[bool] = None,
         hub_token: Optional[str] = None,
         revision: Optional[str] = None,
@@ -84,7 +84,15 @@ class SglangEngine(InferEngine):
         self.log_level = log_level
         if template is None:
             processor = self._get_processor()
-            template = self._get_template(processor)
+            template = self._get_template(processor, template_type=template_type)
+        else:
+            safe_snapshot_download(
+                model_id_or_path,
+                revision=revision,
+                download_model=True,
+                use_hf=use_hf,
+                ignore_patterns=getattr(template.model_meta, 'ignore_patterns', None),
+                hub_token=hub_token)
         super().__init__(template)
         self._prepare_server_args(engine_kwargs)
         self.engine = sgl.Engine(server_args=self.server_args)
@@ -94,7 +102,7 @@ class SglangEngine(InferEngine):
 
     def _get_processor(self):
         return get_processor(
-            self.model_id_or_path,
+            model_id_or_path=self.model_id_or_path,
             torch_dtype=self.torch_dtype,
             download_model=True,
             model_type=self.model_type,

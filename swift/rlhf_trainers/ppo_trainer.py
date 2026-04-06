@@ -1,15 +1,20 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import inspect
+import trl
 from contextlib import contextmanager
-from typing import Optional
-
+from packaging import version
 from torch.utils.data import DataLoader
 from transformers import PreTrainedModel
 from transformers import Trainer as HfTrainer
-from trl import PPOTrainer as HFPPOTrainer
+from typing import Optional
 
+from swift.trainers import SwiftMixin
 from swift.utils import patch_getattr
-from ..mixin import SwiftMixin
+
+if version.parse(trl.__version__) >= version.parse('0.26.0'):
+    from trl.experimental.ppo import PPOTrainer as HFPPOTrainer
+else:
+    from trl import PPOTrainer as HFPPOTrainer
 
 ppo_trainer_init = HFPPOTrainer.__init__
 del HFPPOTrainer.__init__
@@ -34,6 +39,7 @@ class PPOTrainer(SwiftMixin, HFPPOTrainer):
 
     def __init__(self, model: PreTrainedModel, ref_model: PreTrainedModel, *_args, **kwargs):
         super().__init__(model, *_args, **{k: v for k, v in kwargs.items() if k not in {'reward_model', 'value_model'}})
+        kwargs['data_collator'] = self.data_collator
         with self._patch_dataloader(kwargs['data_collator']):
             new_kwargs = {
                 k: v
@@ -59,7 +65,7 @@ class PPOTrainer(SwiftMixin, HFPPOTrainer):
         unwrap_model = self.accelerator.unwrap_model(self.model)
         patch_getattr(unwrap_model.__class__, 'policy')
 
-    def create_loss_and_metric(self, args):
+    def create_loss_and_eval_metric(self, args):
         return {}
 
     def train(self, *args, **kwargs):

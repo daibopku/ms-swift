@@ -1,15 +1,15 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from dataclasses import dataclass, field
-from functools import partial
-from typing import Any, Dict, List, Literal, Optional
-
+import inspect
 import torch
 import torch.nn.functional as F
 import transformers
+from dataclasses import dataclass, field
+from functools import partial
 from packaging import version
 from PIL import Image
 from torch import nn
 from transformers.integrations import is_deepspeed_zero3_enabled
+from typing import Any, Dict, List, Literal, Optional
 
 from swift.utils import get_env_args, get_packed_seq_params, is_deepspeed_enabled, to_float_dtype
 from ..base import Template
@@ -311,6 +311,10 @@ class Qwen2VLTemplate(Template):
         from qwen_vl_utils import fetch_image, fetch_video
         assert media_type in {'image', 'video'}
         kwargs = {'image_patch_size': self.processor.image_processor.patch_size} if self.version == 'v3' else {}
+        if self.mode == 'vllm':
+            # resized in qwen_vl_utils, no need to resize again in vllm
+            # ref: https://github.com/modelscope/ms-swift/issues/8445
+            inputs.mm_processor_kwargs['do_resize'] = False
         if media_type == 'image':
             inputs.images[index] = fetch_image({'image': inputs.images[index]}, **kwargs)
             if self.mode == 'lmdeploy':
@@ -431,7 +435,7 @@ class Qwen2VLTemplate(Template):
         for r in row:
             r_copy = r.copy()
             r_copy['input_ids'] = torch.tensor(r_copy['input_ids'])[None]
-            r['position_ids'] = self._get_position_ids(r_copy)
+            r.update(self._get_position_ids(r_copy))
         packed = super().packing_row(row)
         return packed
 
@@ -448,19 +452,25 @@ class Qwen2VLTemplate(Template):
         attention_mask = inputs.get('attention_mask_2d')
         if attention_mask is None:
             attention_mask = inputs.get('attention_mask')
+        input_ids = inputs['input_ids']
+        if 'mm_token_type_ids' in inspect.signature(get_rope_index).parameters:
+            kwargs['mm_token_type_ids'] = self.create_mm_token_type_ids(input_ids)
+        elif not self.is_training:
+            # Compatible with older versions of transformers
+            return {}
         position_ids, _ = get_rope_index(
-            inputs['input_ids'],
-            inputs.get('image_grid_thw'),
-            inputs.get('video_grid_thw'),
+            input_ids,
+            image_grid_thw=inputs.get('image_grid_thw'),
+            video_grid_thw=inputs.get('video_grid_thw'),
             attention_mask=attention_mask,
             **kwargs)
-        return self._concat_text_position_ids(position_ids)
+        return {'position_ids': self._concat_text_position_ids(position_ids)}
 
     def _data_collator(self, batch: List[Dict[str, Any]], *, padding_to: Optional[int] = None) -> Dict[str, Any]:
         res = super()._data_collator(batch, padding_to=padding_to)
-        if not self.padding_free and self.is_training:
-            res['position_ids'] = self._get_position_ids(res)
-        if 'position_ids' in res:
+        if not self.padding_free:
+            res.update(self._get_position_ids(res))
+        if 'position_ids' in res and self.is_training:
             position_ids = res['position_ids']
             res['position_ids'] = position_ids[1:]
             res['text_position_ids'] = text_position_ids = position_ids[0]
@@ -628,6 +638,25 @@ register_template(
         MLLMTemplateType.qwen3_vl, template_cls=Qwen3VLTemplate, default_system=None, thinking_prefix='<think>\n'))
 
 
+class Qwen3_5Template(Qwen3VLTemplate):
+    image_token_id = 248056
+    video_token_id = 248057
+
+    def _post_encode(self, model, inputs: Dict[str, Any]) -> Dict[str, Any]:
+        return Qwen2VLTemplate._post_encode(self, model, inputs)
+
+
+register_template(
+    QwenTemplateMeta(
+        MLLMTemplateType.qwen3_5,
+        template_cls=Qwen3_5Template,
+        default_system=None,
+        thinking_prefix='<think>\n',
+        non_thinking_prefix='<think>\n\n</think>\n\n',
+        agent_template='qwen3_5',
+        is_thinking=True))
+
+
 class Qwen3VLEmbTemplate(Qwen3VLTemplate):
 
     def _preprocess_inputs(self, inputs: StdTemplateInputs) -> None:
@@ -689,8 +718,12 @@ class Qwen2_5OmniTemplate(Qwen2_5VLTemplate):
     def replace_tag(self, media_type: Literal['image', 'video', 'audio'], index: int,
                     inputs: StdTemplateInputs) -> List[Context]:
         from qwen_omni_utils import fetch_image, fetch_video
+        kwargs = {'image_patch_size': self.processor.image_processor.patch_size} if self.version == 'omni_v3' else {}
+        if self.mode == 'vllm':
+            # https://github.com/modelscope/ms-swift/issues/8445
+            inputs.mm_processor_kwargs['do_resize'] = False
         if media_type == 'image':
-            inputs.images[index] = fetch_image({'image': inputs.images[index]})
+            inputs.images[index] = fetch_image({'image': inputs.images[index]}, **kwargs)
             if self.version == 'omni_v2_5':
                 return ['<|vision_bos|><|IMAGE|><|vision_eos|>']
             elif self.version == 'omni_v3':
@@ -704,7 +737,7 @@ class Qwen2_5OmniTemplate(Qwen2_5VLTemplate):
                 return ['<|audio_start|><|audio_pad|><|audio_end|>']
         elif media_type == 'video':
             video = inputs.videos[index]
-            _video = fetch_video({'video': video})
+            _video = fetch_video({'video': video}, **kwargs)
             if isinstance(_video, torch.Tensor):
                 _video = _video.to(torch.uint8)
             inputs.videos[index] = _video
@@ -887,10 +920,18 @@ class Qwen2_5OmniTemplate(Qwen2_5VLTemplate):
                 # Note: ZeRO-3 still results in hangs; for audio training, please use ZeRO-2.
                 input_features = input_ids.new_zeros([1, 128, 128], dtype=model.thinker.audio_tower.dtype)
                 feature_attention_mask = input_ids.new_ones([1, 128], dtype=torch.bool)
-                audio_embeds = model.thinker.get_audio_features(input_features, feature_attention_mask)
+                audio_res = model.thinker.get_audio_features(input_features, feature_attention_mask)
+                if hasattr(audio_res, 'last_hidden_state'):
+                    audio_embeds = audio_res.last_hidden_state
+                else:
+                    audio_embeds = audio_res
                 inputs_embeds = inputs_embeds + audio_embeds.mean() * 0.
         else:
-            audio_embeds = model.thinker.get_audio_features(input_features, feature_attention_mask)
+            audio_res = model.thinker.get_audio_features(input_features, feature_attention_mask)
+            if hasattr(audio_res, 'last_hidden_state'):
+                audio_embeds = audio_res.last_hidden_state
+            else:
+                audio_embeds = audio_res
             audio_mask = (input_ids == thinker_config.audio_token_index).unsqueeze(-1).expand_as(inputs_embeds)
             audio_embeds = audio_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             inputs_embeds = inputs_embeds.masked_scatter(audio_mask, audio_embeds)
@@ -1197,3 +1238,50 @@ class MarcoO1TemplateMeta(QwenTemplateMeta):
 
 
 register_template(MarcoO1TemplateMeta(LLMTemplateType.marco_o1))
+
+YUFENG_XGUARD_TEMPLATE = ('<|im_start|>user\n'
+                          'You are an expert in content safety evaluation, possessing strong '
+                          'language comprehension and risk identification skills.\n'
+                          'Your task is to classify the provided input text into the most appropriate '
+                          'category from the list below as part of a safety audit project.\n\n'
+                          '# Category List\n'
+                          '- sec: Safe\n'
+                          '- pc: Pornographic Contraband\n'
+                          '- dc: Drug Crimes\n'
+                          '- dw: Dangerous Weapons\n'
+                          '- pi: Property Infringement\n'
+                          '- ec: Economic Crimes\n'
+                          '- ac: Abusive Curses\n'
+                          '- def: Defamation\n'
+                          '- ti: Threats and Intimidation\n'
+                          '- cy: Cyberbullying\n'
+                          '- ph: Physical Health\n'
+                          '- mh: Mental Health\n'
+                          '- se: Social Ethics\n'
+                          '- sci: Science Ethics\n'
+                          '- pp: Personal Privacy\n'
+                          '- cs: Commercial Secret\n'
+                          '- acc: Access Control\n'
+                          '- mc: Malicious Code\n'
+                          '- ha: Hacker Attack\n'
+                          '- ps: Physical Security\n'
+                          '- ter: Violent Terrorist Activities\n'
+                          '- sd: Social Disruption\n'
+                          '- ext: Extremist Ideological Trends\n'
+                          '- fin: Finance\n'
+                          '- med: Medicine\n'
+                          '- law: Law\n'
+                          '- cm: Corruption of Minors\n'
+                          '- ma: Minor Abuse and Exploitation\n'
+                          '- md: Minor Delinquency\n\n'
+                          '# Instructions\n'
+                          '- Identify the single most relevant category ID for the input text.\n'
+                          '- On the next line, provide a concise justification for your choice, '
+                          'placing it between <explanation> and </explanation> tags.\n\n'
+                          '---\n\n'
+                          'Input Text: {{QUERY}}<|im_end|>\n'
+                          '<|im_start|>assistant\n')
+register_template(Qwen3MixedTemplateMeta(
+    LLMTemplateType.yufeng_xguard,
+    prompt=[YUFENG_XGUARD_TEMPLATE],
+))

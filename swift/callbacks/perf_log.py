@@ -1,15 +1,14 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import time
-from typing import TYPE_CHECKING
-
 import torch
 from transformers import TrainerControl, TrainerState
+from typing import TYPE_CHECKING
 
-from swift.utils import empty_cache, get_logger
+from swift.utils import empty_cache, get_current_device, get_device_count, get_env_args, get_logger, synchronize
 from .base import TrainerCallback
 
 if TYPE_CHECKING:
-    from swift.trainers import TrainingArguments, Trainer
+    from swift.trainers import Trainer, TrainingArguments
 
 logger = get_logger()
 
@@ -43,7 +42,6 @@ class PerfMetricsLogCallback(TrainerCallback):
         self.step_start_time = None
 
     def on_init_end(self, args: 'TrainingArguments', state: TrainerState, control: TrainerControl, **kwargs):
-        from swift.utils import get_current_device, get_device_count, get_env_args
 
         # Top priority. Specify by ENV
         tflops = get_env_args('DEVICE_TFLOPS', int, None)
@@ -77,15 +75,6 @@ class PerfMetricsLogCallback(TrainerCallback):
 
     @staticmethod
     def _estimate_device_tflops_by_dtype(device: torch.device, dtype: torch.dtype, repeats: int = 60, dim: int = 8192):
-
-        def device_synchronize(sync_device):
-            if backend == 'cuda':
-                torch.cuda.synchronize(sync_device)
-            elif backend == 'npu':
-                torch.npu.synchronize(sync_device)
-            elif backend == 'cpu':
-                torch.cpu.synchronize(sync_device)
-
         # Set matrix dimension
         shape = (dim, dim)
         backend = device.type
@@ -99,13 +88,13 @@ class PerfMetricsLogCallback(TrainerCallback):
         # Warm-up
         for _ in range(5):
             c = torch.matmul(a, b)
-        device_synchronize(device)
+        synchronize(device)
 
         # Run benchmark test
         start = time.time()
         for _ in range(repeats):
             c = torch.matmul(a, b)
-        device_synchronize(device)
+        synchronize(device)
         end = time.time()
         total_time = end - start
         avg_time = total_time / repeats
@@ -116,7 +105,7 @@ class PerfMetricsLogCallback(TrainerCallback):
             start = time.time()
             for _ in range(repeats):
                 c = torch.matmul(a, b)
-            device_synchronize(device)
+            synchronize(device)
             end = time.time()
             total_time = end - start
             avg_time = total_time / repeats

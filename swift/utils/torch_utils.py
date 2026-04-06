@@ -1,22 +1,22 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import gc
 import hashlib
+import numpy as np
 import os
 import pickle
 import time
-import uuid
-from contextlib import contextmanager
-from datetime import timedelta
-from typing import Any, Mapping, Optional, Union
-
-import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+import uuid
+from contextlib import contextmanager
 from datasets.utils.filelock import FileLock
+from datetime import timedelta
 from modelscope.hub.utils.utils import get_cache_dir
 from transformers.utils import is_torch_cuda_available, is_torch_mps_available, is_torch_npu_available
+from typing import Any, Mapping, Optional, Union
 
+from swift.utils import is_mp
 from .env import get_dist_setting, get_node_setting, is_dist, is_local_master, is_master
 from .logger import get_logger
 
@@ -29,8 +29,17 @@ def _find_local_mac() -> str:
     return mac_address
 
 
+def synchronize(device: Union[torch.device, str, int, None] = None):
+    if is_torch_npu_available():
+        torch.npu.synchronize(device)
+    elif is_torch_cuda_available():
+        torch.cuda.synchronize(device)
+    else:
+        torch.cuda.synchronize(device)
+
+
 def time_synchronize() -> float:
-    torch.cuda.synchronize()
+    synchronize()
     return time.perf_counter()  # second
 
 
@@ -282,11 +291,20 @@ def to_device(data: Any, device: Union[str, torch.device, int], non_blocking: bo
         return data
 
 
-def get_generative_reranker_logits(module, tokenizer, hidden_states):
+def get_generative_reranker_logits(lm_head_weight, tokenizer, hidden_states):
     positive_token = os.environ.get('GENERATIVE_RERANKER_POSITIVE_TOKEN', 'yes')
     negative_token = os.environ.get('GENERATIVE_RERANKER_NEGATIVE_TOKEN', 'no')
     positive_token_id = tokenizer.convert_tokens_to_ids(positive_token)
     negative_token_id = tokenizer.convert_tokens_to_ids(negative_token)
-    weight = module.weight[[positive_token_id, negative_token_id]]
+    weight = lm_head_weight[[positive_token_id, negative_token_id]]
     logits = F.linear(hidden_states, weight)
     return logits[..., 0:1] - logits[..., 1:2]
+
+
+def get_max_reserved_memory() -> float:
+    devices = list(range(get_device_count())) if is_mp() else [None]
+    try:
+        mems = [get_torch_device().max_memory_reserved(device=device) for device in devices]
+    except AttributeError:
+        return 0  # fix mps
+    return sum(mems) / 1024**3

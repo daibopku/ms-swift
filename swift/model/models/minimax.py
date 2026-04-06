@@ -1,7 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import os
-
 import json
+import os
 from transformers import AutoProcessor, PretrainedConfig, PreTrainedModel
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
@@ -93,6 +92,7 @@ register_model(
 class MinimaxTextLoader(ModelLoader):
 
     def get_model(self, model_dir: str, config, processor, model_kwargs) -> PreTrainedModel:
+        logger.warn('NOTE: minimax-text-01 model does not support training.')
         n_gpu = get_device_count()
         _, local_rank, _, local_world_size = get_dist_setting()
         device_ids = list(range(max(local_rank, 0), n_gpu, local_world_size))
@@ -151,9 +151,13 @@ register_model(
         LLMModelType.minimax_m2, [
             ModelGroup([
                 Model('MiniMax/MiniMax-M2', 'MiniMaxAI/MiniMax-M2'),
-                Model('MiniMax/MiniMax-M2.1', 'MiniMaxAI/MiniMax-M2.1')
-            ]),
+            ], TemplateType.minimax_m2),
+            ModelGroup([
+                Model('MiniMax/MiniMax-M2.1', 'MiniMaxAI/MiniMax-M2.1'),
+            ], TemplateType.minimax_m2_1),
+            ModelGroup([
+                Model('MiniMax/MiniMax-M2.5', 'MiniMaxAI/MiniMax-M2.5'),
+            ], TemplateType.minimax_m2_5),
         ],
-        template=TemplateType.minimax_m2,
         requires=['transformers==4.57.1'],
         architectures=['MiniMaxM2ForCausalLM']))

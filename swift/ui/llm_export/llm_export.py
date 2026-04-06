@@ -1,15 +1,14 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import gradio as gr
+import json
 import os
 import re
 import sys
 from datetime import datetime
 from functools import partial
-from typing import Type
-
-import gradio as gr
-import json
 from json import JSONDecodeError
 from transformers.utils import is_torch_cuda_available, is_torch_npu_available
+from typing import Type
 
 from swift.arguments import ExportArguments
 from swift.utils import get_device_count
@@ -131,7 +130,8 @@ class LLMExport(BaseUI):
         kwargs.update(more_params)
         model = kwargs.get('model')
         if os.path.exists(model) and os.path.exists(os.path.join(model, 'args.json')):
-            kwargs['ckpt_dir'] = kwargs.pop('model')
+            if os.path.exists(os.path.join(model, 'adapter_config.json')):
+                kwargs['adapters'] = kwargs.pop('model')
         export_args = ExportArguments(
             **{
                 key: value.split(' ') if key in kwargs_is_list and kwargs_is_list[key] else value

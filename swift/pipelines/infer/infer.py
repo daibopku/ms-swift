@@ -1,9 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from typing import Any, Dict, List, Optional, Union
-
 import numpy as np
 from datasets import Dataset as HfDataset
 from tqdm import tqdm
+from typing import Any, Dict, List, Optional, Union
 
 from swift.arguments import InferArguments
 from swift.dataset import DatasetLoader, load_dataset, sample_dataset
@@ -49,15 +48,15 @@ class SwiftInfer(SwiftPipeline):
             raise
 
     @staticmethod
-    def get_infer_engine(args: InferArguments, template=None, **kwargs):
-        kwargs.update({
+    def get_infer_engine(args: InferArguments, template=None, **extra_kwargs):
+        infer_backend = extra_kwargs.pop('infer_backend', None) or args.infer_backend
+        kwargs = {
             'model_id_or_path': args.model,
             'model_type': args.model_type,
             'revision': args.model_revision,
             'torch_dtype': args.torch_dtype,
             'template': template,
-        })
-        infer_backend = kwargs.pop('infer_backend', None) or args.infer_backend
+        }
         if infer_backend in {'transformers', 'vllm'}:
             kwargs['reranker_use_activation'] = args.reranker_use_activation
         if infer_backend == 'transformers':
@@ -86,6 +85,7 @@ class SwiftInfer(SwiftPipeline):
         else:
             raise ValueError(f'Inference backend `{infer_backend}` is not supported. '
                              'Please use one of: transformers, vllm, sglang, lmdeploy.')
+        kwargs.update(extra_kwargs)
         return infer_engine_cls(**kwargs)
 
     def run(self) -> List[Dict[str, Any]]:

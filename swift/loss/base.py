@@ -1,11 +1,10 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import torch
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 
-import torch
-
 if TYPE_CHECKING:
-    from swift.trainers import TrainingArguments, Trainer
+    from swift.trainers import Trainer, TrainingArguments
 
 
 class BaseLoss(ABC):
@@ -30,6 +29,8 @@ class BaseLoss(ABC):
         """
         self.args = args
         self.trainer = trainer
+        mro_class_names = [cls.__name__ for cls in trainer.__class__.__mro__]
+        self.is_megatron = 'BaseMegatronTrainer' in mro_class_names
 
     @abstractmethod
     def __call__(self, outputs, labels, *, num_items_in_batch=None, loss_scale=None, **kwargs) -> torch.Tensor:
