@@ -571,7 +571,6 @@ class Qwen3VLTemplate(Qwen2VLTemplate):
         # and expand the corresponding tokens, while attaching pulse pixel inputs.
         pulse_data = getattr(inputs, 'pulses', None)
         if pulse_data:
-            split_token = self._tokenize('\n')[0]
             vision_start = getattr(processor, 'vision_start_token', '<|vision_start|>')
             vision_end = getattr(processor, 'vision_end_token', '<|vision_end|>')
             pulse_frame_token = getattr(processor, 'pulse_frame_token', '<|pulse_frame_pad|>')
@@ -586,39 +585,59 @@ class Qwen3VLTemplate(Qwen2VLTemplate):
             frame_positions = findall(input_ids, pulse_frame_seq)
             object_positions = findall(input_ids, pulse_object_seq)
 
-            has_object = bool(object_positions)
-            pulse_placeholder = f"{vision_start}{pulse_frame_token}{vision_end}"
-            if has_object:
-                pulse_placeholder += f"{vision_start}{pulse_object_token}{vision_end}"
-
+            # The custom pulse template may already expand one pulse sample into
+            # multiple per-time-step placeholders. Compute the per-sample layout
+            # from pulse preprocessing metadata, then only inject the fully
+            # expanded token sequence at the first placeholder position of each
+            # sample and drop the remaining placeholders for that sample.
             pulse_inputs = processor(
-                text=['\n'.join([pulse_placeholder] * len(pulse_data))],
                 pulses=pulse_data,
                 return_tensors='pt',
                 do_resize=False,
                 **inputs.mm_processor_kwargs)
+            pulse_token_grid_tnn = pulse_inputs.get('pulse_token_grid_tnn')
+            pulse_frame_grid_thw = pulse_inputs.get('pulse_frame_grid_thw')
+            pulse_timestamps = pulse_inputs.get('pulse_timestamps')
+            merge_length = processor.video_processor.merge_size**2
 
-            pulse_tokens_per_sample = self._split_list(pulse_inputs['input_ids'][0].tolist(), split_token)
-            pulse_inputs.pop('input_ids', None)
-            pulse_inputs.pop('attention_mask', None)
+            pulse_tokens_per_sample = []
+            sample_position_counts: List[int] = []
+            for sample_idx, (pulse_item, grid_tnn, frame_grid_thw) in enumerate(
+                    zip(pulse_data, pulse_token_grid_tnn, pulse_frame_grid_thw)):
+                time_steps = int(grid_tnn[0].item())
+                object_count = int(grid_tnn[1].item())
+                include_graph = not bool(getattr(pulse_item, 'get', lambda *_: True)('only_frame', False))
+                frame_token_len = int((frame_grid_thw[1:].prod() // merge_length).item())
+                timestamps = pulse_timestamps[sample_idx] if pulse_timestamps is not None else [0.0] * time_steps
 
-            idx_list: List[int] = frame_positions + object_positions
-            kinds: List[str] = ['frame'] * len(frame_positions) + ['object'] * len(object_positions)
+                sample_text = ''
+                for frame_idx in range(time_steps):
+                    curr_time = timestamps[frame_idx] if frame_idx < len(timestamps) else timestamps[-1]
+                    sample_text += f'<{curr_time:.1f} seconds>'
+                    sample_text += vision_start + pulse_frame_token * frame_token_len + vision_end
+                    if include_graph:
+                        sample_text += (f'{vision_start}{pulse_object_token}{vision_end}' * (object_count * object_count))
 
-            # Keep the order of appearance
-            zipped = sorted(zip(idx_list, kinds), key=lambda x: x[0])
-            idx_list = [z[0] for z in zipped]
-            kinds = [z[1] for z in zipped]
+                pulse_tokens_per_sample.append(processor.tokenizer.encode(sample_text, add_special_tokens=False))
+                sample_position_counts.append(time_steps * (1 + (object_count * object_count if include_graph else 0)))
 
-            frame_idx = -1
+            idx_list = sorted(frame_positions + object_positions)
+            sample_idx_by_position: List[int] = []
+            expand_position_mask: List[bool] = []
+            consumed = 0
+            for sample_idx, count in enumerate(sample_position_counts):
+                if count <= 0:
+                    continue
+                sample_idx_by_position.extend([sample_idx] * count)
+                expand_position_mask.extend([True] + [False] * (count - 1))
+                consumed += count
+
+            idx_list = idx_list[:consumed]
 
             def _get_pulse_tokens(i: int):
-                nonlocal frame_idx
-                # Replace the frame token with the full expanded tokens; drop the object token to avoid duplication
-                if kinds[i] == 'frame':
-                    frame_idx += 1
-                    return pulse_tokens_per_sample[frame_idx]
-                return []
+                if not expand_position_mask[i]:
+                    return []
+                return pulse_tokens_per_sample[sample_idx_by_position[i]]
 
             input_ids, labels, loss_scale = self._extend_tokens(input_ids, labels, loss_scale, idx_list,
                                                                 _get_pulse_tokens)
