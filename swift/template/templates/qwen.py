@@ -579,10 +579,13 @@ class Qwen3VLTemplate(Qwen2VLTemplate):
             # Token sequences (can be multi-token if tokenizer lacks dedicated specials)
             pulse_frame_seq = processor.tokenizer.encode(
                 f"{vision_start}{pulse_frame_token}{vision_end}", add_special_tokens=False)
+            pulse_anchor_seq = processor.tokenizer.encode(
+                pulse_frame_token, add_special_tokens=False)
             pulse_object_seq = processor.tokenizer.encode(
                 f"{vision_start}{pulse_object_token}{vision_end}", add_special_tokens=False)
 
-            frame_positions = findall(input_ids, pulse_frame_seq)
+            frame_positions = findall(input_ids, pulse_anchor_seq)
+            legacy_frame_positions = findall(input_ids, pulse_frame_seq)
             object_positions = findall(input_ids, pulse_object_seq)
 
             # The custom pulse template may already expand one pulse sample into
@@ -616,28 +619,34 @@ class Qwen3VLTemplate(Qwen2VLTemplate):
                     sample_text += f'<{curr_time:.1f} seconds>'
                     sample_text += vision_start + pulse_frame_token * frame_token_len + vision_end
                     if include_graph:
-                        sample_text += (f'{vision_start}{pulse_object_token}{vision_end}' * (object_count * object_count))
+                        sample_text += vision_start + pulse_object_token * (object_count * object_count) + vision_end
 
                 pulse_tokens_per_sample.append(processor.tokenizer.encode(sample_text, add_special_tokens=False))
-                sample_position_counts.append(time_steps * (1 + (object_count * object_count if include_graph else 0)))
+                sample_position_counts.append(time_steps * (2 if include_graph else 1))
 
-            idx_list = sorted(frame_positions + object_positions)
-            sample_idx_by_position: List[int] = []
-            expand_position_mask: List[bool] = []
-            consumed = 0
-            for sample_idx, count in enumerate(sample_position_counts):
-                if count <= 0:
-                    continue
-                sample_idx_by_position.extend([sample_idx] * count)
-                expand_position_mask.extend([True] + [False] * (count - 1))
-                consumed += count
+            if len(frame_positions) >= len(pulse_tokens_per_sample):
+                idx_list = frame_positions[:len(pulse_tokens_per_sample)]
 
-            idx_list = idx_list[:consumed]
+                def _get_pulse_tokens(i: int):
+                    return pulse_tokens_per_sample[i]
+            else:
+                idx_list = sorted(legacy_frame_positions + object_positions)
+                sample_idx_by_position: List[int] = []
+                expand_position_mask: List[bool] = []
+                consumed = 0
+                for sample_idx, count in enumerate(sample_position_counts):
+                    if count <= 0:
+                        continue
+                    sample_idx_by_position.extend([sample_idx] * count)
+                    expand_position_mask.extend([True] + [False] * (count - 1))
+                    consumed += count
 
-            def _get_pulse_tokens(i: int):
-                if not expand_position_mask[i]:
-                    return []
-                return pulse_tokens_per_sample[sample_idx_by_position[i]]
+                idx_list = idx_list[:consumed]
+
+                def _get_pulse_tokens(i: int):
+                    if not expand_position_mask[i]:
+                        return []
+                    return pulse_tokens_per_sample[sample_idx_by_position[i]]
 
             input_ids, labels, loss_scale = self._extend_tokens(input_ids, labels, loss_scale, idx_list,
                                                                 _get_pulse_tokens)
