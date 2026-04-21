@@ -14,20 +14,23 @@ if TYPE_CHECKING:
     from swift.arguments import SftArguments
 
 
-def is_vit_aligner_param(model_arch, parameter_name: str) -> bool:
-    for module_prefix in model_arch.vision_tower + model_arch.aligner:
+def is_aligner_param(model_arch, parameter_name: str) -> bool:
+    for module_prefix in model_arch.aligner:
         if f'.{module_prefix}.' in parameter_name:
             return True
     return False
 
 
-class LoRALLMTuner(Tuner):
-    """Full-parameter training of ViT/Aligner while LoRA training LLM"""
+class AlignerLoRALLMTuner(Tuner):
+    """Full-parameter training of aligner while LoRA training LLM."""
 
     @staticmethod
     def from_pretrained(model: torch.nn.Module, model_id: str, **kwargs) -> torch.nn.Module:
         model = PeftModel.from_pretrained(model, model_id, **kwargs)
-        state_dict = safetensors.torch.load_file(os.path.join(model_id, 'vit.safetensors'))
+        state_path = os.path.join(model_id, 'aligner.safetensors')
+        if not os.path.exists(state_path):
+            raise FileNotFoundError(f'aligner.safetensors not found in {model_id}')
+        state_dict = safetensors.torch.load_file(state_path)
         model.load_state_dict(state_dict, strict=False)
         return model
 
@@ -45,11 +48,10 @@ class LoRALLMTuner(Tuner):
                 if p.requires_grad:
                     state_dict[n] = p.detach().cpu()
         model.save_pretrained(save_directory, state_dict=state_dict, safe_serialization=safe_serialization, **kwargs)
-        # vit/aligner
         model_arch = model.model_meta.model_arch
-        state_dict = {k: v for k, v in state_dict.items() if is_vit_aligner_param(model_arch, k)}
+        state_dict = {k: v for k, v in state_dict.items() if is_aligner_param(model_arch, k)}
         safetensors.torch.save_file(
-            state_dict, os.path.join(save_directory, 'vit.safetensors'), metadata={'format': 'pt'})
+            state_dict, os.path.join(save_directory, 'aligner.safetensors'), metadata={'format': 'pt'})
 
     @staticmethod
     def prepare_model(args: 'SftArguments', model: torch.nn.Module) -> torch.nn.Module:
@@ -60,11 +62,11 @@ class LoRALLMTuner(Tuner):
             task_type=args.task_type.upper(), r=args.lora_rank, lora_alpha=args.lora_alpha, target_modules=target_regex)
         model = get_peft_model(model, lora_config)
         trainable_root = model.model if isinstance(model, PeftModel) else model
-        for module_prefix in model_arch.vision_tower + model_arch.aligner:
+        for module_prefix in model_arch.aligner:
             module = deep_getattr(trainable_root, module_prefix)
             if module is None:
                 module = deep_getattr(model, module_prefix)
             if module is None:
-                raise AttributeError(f'Unable to resolve multimodal module for LoRA-LLM tuning: {module_prefix}')
+                raise AttributeError(f'Unable to resolve aligner module for Aligner-LoRA-LLM tuning: {module_prefix}')
             module.requires_grad_(True)
         return model
