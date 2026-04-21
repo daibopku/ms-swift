@@ -605,24 +605,36 @@ class Qwen3VLTemplate(Qwen2VLTemplate):
 
             pulse_tokens_per_sample = []
             sample_position_counts: List[int] = []
-            for sample_idx, (pulse_item, grid_tnn, frame_grid_thw) in enumerate(
-                    zip(pulse_data, pulse_token_grid_tnn, pulse_frame_grid_thw)):
+            pulse_frame_grid_index = 0
+            for sample_idx, (pulse_item, grid_tnn) in enumerate(zip(pulse_data, pulse_token_grid_tnn)):
                 time_steps = int(grid_tnn[0].item())
                 object_count = int(grid_tnn[1].item())
-                include_graph = not bool(getattr(pulse_item, 'get', lambda *_: True)('only_frame', False))
-                frame_token_len = int((frame_grid_thw[1:].prod() // merge_length).item())
+                pulse_get = getattr(pulse_item, 'get', lambda *_: None)
+                only_frame = bool(pulse_get('only_frame', False))
+                graph_only = bool(pulse_get('graph_only', False))
+                include_graph = not only_frame
                 timestamps = pulse_timestamps[sample_idx] if pulse_timestamps is not None else [0.0] * time_steps
 
                 sample_text = ''
-                for frame_idx in range(time_steps):
-                    curr_time = timestamps[frame_idx] if frame_idx < len(timestamps) else timestamps[-1]
-                    sample_text += f'<{curr_time:.1f} seconds>'
-                    sample_text += vision_start + pulse_frame_token * frame_token_len + vision_end
-                    if include_graph:
+                if graph_only:
+                    for frame_idx in range(time_steps):
+                        curr_time = timestamps[frame_idx] if frame_idx < len(timestamps) else timestamps[-1]
+                        sample_text += f'<{curr_time:.1f} seconds>'
                         sample_text += vision_start + pulse_object_token * (object_count * object_count) + vision_end
+                    sample_position_counts.append(time_steps)
+                else:
+                    frame_grid_thw = pulse_frame_grid_thw[pulse_frame_grid_index]
+                    pulse_frame_grid_index += 1
+                    frame_token_len = int((frame_grid_thw[1:].prod() // merge_length).item())
+                    for frame_idx in range(time_steps):
+                        curr_time = timestamps[frame_idx] if frame_idx < len(timestamps) else timestamps[-1]
+                        sample_text += f'<{curr_time:.1f} seconds>'
+                        sample_text += vision_start + pulse_frame_token * frame_token_len + vision_end
+                        if include_graph:
+                            sample_text += vision_start + pulse_object_token * (object_count * object_count) + vision_end
+                    sample_position_counts.append(time_steps * (2 if include_graph else 1))
 
                 pulse_tokens_per_sample.append(processor.tokenizer.encode(sample_text, add_special_tokens=False))
-                sample_position_counts.append(time_steps * (2 if include_graph else 1))
 
             if len(frame_positions) >= len(pulse_tokens_per_sample):
                 idx_list = frame_positions[:len(pulse_tokens_per_sample)]
